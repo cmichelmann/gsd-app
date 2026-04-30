@@ -261,6 +261,7 @@ function getDefaults() {
     settings: {
       notifications: false, userName: "", dailyRitualDate: null, onboarded: false, lastRolloverDate: null,
       notifTasks: true, notifEvents: true, notifBirthdays: true, notifWorkouts: true, notifHabits: false,
+      dailyDigest: false, dailyDigestTime: "07:00",
     },
     tasks: [], events: [], workouts: [], projects: [], habits: [],
     shoppingLists: [], goals: [], books: [], budget: [], notes: [], meals: {},
@@ -297,6 +298,7 @@ const migrations = {
     notes: d.notes || [],
     settings: {
       notifTasks: true, notifEvents: true, notifBirthdays: true, notifWorkouts: true, notifHabits: false,
+      dailyDigest: false, dailyDigestTime: "07:00",
       ...(d.settings || {}),
     },
   }),
@@ -410,11 +412,11 @@ const DAYS_FULL  = ["Montag","Dienstag","Mittwoch","Donnerstag","Freitag","Samst
 const MONTHS_DE  = ["Januar","Februar","März","April","Mai","Juni","Juli","August","September","Oktober","November","Dezember"];
 
 const SHIT_SPRUECHE = [
-  "SHIT DONE!", "EINE WENIGER!", "BOAH GEIL!", "KRASS, ERLEDIGT!",
-  "BOOM! WEG DAMIT!", "KACKE ABGEHAKT!", "ABGESCHISSEN!", "FERTIG DER MIST!",
-  "HALLELUJA!", "KNALLER!", "GET SHIT DONE!", "DURCHGEZOGEN!",
-  "BÄM! ERLEDIGT!", "RAUS DAMIT!", "VOLLE KANNE GENAGELT!", "SHIT GONE!",
-  "WIE EIN BOSS!", "DURCHGEKACKT!", "EINS ABGEFRÜHSTÜCKT!", "ANGENAGELT!",
+  "SHIT DONE!", "EINE WENIGER!", "ABGESCHISSEN!", "SCHEISSE VERSENKT!",
+  "SHIT ERLEDIGT!", "KACKE ABGEHAKT!", "ABGESCHISSEN!", "FERTIG DER MIST!",
+  "SCHEISSE GECLEART!", "ERLEDIGT, DU HUND!", "GET SHIT DONE!", "SHIT GESCHREDDERT!",
+  "SHIT ZERLEGT!", "RAUS DAMIT!", "SHIT GESLAYT!", "SHIT GONE!",
+  "LIKE A BOSS!", "DURCHGEKACKT!", "SCHROTT ERLEDIGT!", "KACK BESIEGT!",
 ];
 
 const catOf = id => CATS.find(c => c.id === id) || CATS[1];
@@ -583,8 +585,76 @@ const Notif = {
     }
     // Web: timeouts can't be reliably cancelled by id without tracking — best effort
   },
+  // Daily digest — schedule full-day plan at chosen time, for next 7 days.
+  // In Capacitor: native schedule survives app close. In web: only fires while open.
+  async scheduleDailyDigest({ time, getStateForDate }) {
+    if (!time) return;
+    const [hh, mm] = time.split(":").map(Number);
+    const now = new Date();
+    for (let i = 0; i < 7; i++) {
+      const d = new Date(now); d.setDate(now.getDate() + i);
+      d.setHours(hh, mm, 0, 0);
+      if (d.getTime() < Date.now()) continue;
+      const dateStr = localDate(d);
+      const { title, body } = getStateForDate(dateStr);
+      this.schedule({
+        id: `digest-${dateStr}`,
+        title, body, at: d, channelKey: "digest",
+      });
+    }
+  },
+  // For test button — fire one immediately
+  async fireNow({ title, body }) {
+    if (this.isCapacitor()) {
+      // const { LocalNotifications } = await import('@capacitor/local-notifications');
+      // await LocalNotifications.schedule({ notifications: [{ id: Date.now() % 2147483647, title, body, schedule: { at: new Date(Date.now() + 1000) } }] });
+      return;
+    }
+    if (typeof Notification === "undefined" || Notification.permission !== "granted") {
+      alert("Notifications nicht erlaubt. Erst aktivieren.");
+      return;
+    }
+    try { new Notification(title, { body, icon: `${import.meta.env.BASE_URL}icon-192.png` }); } catch {}
+  },
 };
 function hashCode(s) { let h = 0; for (let i = 0; i < s.length; i++) { h = ((h << 5) - h) + s.charCodeAt(i); h |= 0; } return h; }
+
+// Build complete day list as text — used for digest notification body
+function buildDigestBody(state, dateStr) {
+  const dt = new Date(dateStr + "T12:00:00");
+  const weekday = (dt.getDay() + 6) % 7;
+  const tasks = state.tasks.filter(t => getTaskDates(t, dateStr, dateStr).includes(dateStr) && t.status !== "done");
+  const events = state.events.filter(e => getEventDates(e, dateStr, dateStr).includes(dateStr));
+  const workouts = state.workouts.filter(w => w.weekday === weekday);
+  const habits = (state.habits || []).filter(h => {
+    if (h.frequency !== "daily") return false;
+    if (!h.weekdays || h.weekdays.length === 0) return true;
+    return h.weekdays.includes(weekday);
+  });
+  const items = [
+    ...events.map(e => ({ time: e.startTime || "", icon: e.isHoliday ? "🎉" : e.type === "birthday" ? "🎂" : e.type === "vacation" ? "✈️" : "📅", title: e.title })),
+    ...tasks.map(t => ({ time: t.startTime || "", icon: t.isFrog ? "💩" : "⚡", title: t.title })),
+    ...workouts.map(w => ({ time: w.time || "", icon: "💪", title: w.title })),
+    ...habits.map(h => ({ time: "", icon: h.emoji || "🔥", title: h.title })),
+  ].sort((a, b) => {
+    if (!a.time && b.time) return -1;
+    if (a.time && !b.time) return 1;
+    return (a.time || "").localeCompare(b.time || "");
+  });
+  const dayLabel = dt.toLocaleDateString("de-DE", { weekday: "long", day: "numeric", month: "long" });
+  const counts = `${events.length} Termine · ${tasks.length} Aufgaben · ${workouts.length} Sport · ${habits.length} Habits`;
+  if (items.length === 0) {
+    return {
+      title: `💩 Dein Tag — ${dayLabel}`,
+      body: "Heute steht nichts an. Nice. Mach was draus.",
+    };
+  }
+  const lines = items.map(it => `${it.time ? it.time + "  " : ""}${it.icon} ${it.title}`).join("\n");
+  return {
+    title: `💩 Dein Tag — ${dayLabel}`,
+    body: `${counts}\n\n${lines}`,
+  };
+}
 
 // ════════════════════════════════════════════════════════════════════════════
 // SEED DATA
@@ -817,7 +887,8 @@ function useDragDrop(onDrop) {
   return { drag, startDrag };
 }
 
-function useNotifications(tasks, events, workouts, habits, settings) {
+function useNotifications(state) {
+  const { tasks, events, workouts, habits, settings } = state;
   const scheduledRef = useRef(new Set());
   useEffect(() => {
     if (!settings.notifications) return;
@@ -873,7 +944,14 @@ function useNotifications(tasks, events, workouts, habits, settings) {
         }
       });
     }
-  }, [tasks, events, workouts, habits, settings.notifications, settings.notifTasks, settings.notifEvents, settings.notifBirthdays, settings.notifWorkouts, settings.notifHabits]);
+    // Daily digest — full day plan at chosen time
+    if (settings.dailyDigest && settings.dailyDigestTime) {
+      Notif.scheduleDailyDigest({
+        time: settings.dailyDigestTime,
+        getStateForDate: (dateStr) => buildDigestBody(state, dateStr),
+      });
+    }
+  }, [tasks, events, workouts, habits, settings.notifications, settings.notifTasks, settings.notifEvents, settings.notifBirthdays, settings.notifWorkouts, settings.notifHabits, settings.dailyDigest, settings.dailyDigestTime]);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -891,7 +969,7 @@ function CelebrationOverlay() {
       setSpruch(SHIT_SPRUECHE[Math.floor(Math.random() * SHIT_SPRUECHE.length)]);
       setPooImg(POO_IMAGES[Math.floor(Math.random() * POO_IMAGES.length)]);
       setActive(true);
-      setTimeout(() => setActive(false), 4000);
+      setTimeout(() => setActive(false), 6000);
     };
     window.addEventListener("gsd:celebrate", handler);
     return () => window.removeEventListener("gsd:celebrate", handler);
@@ -930,7 +1008,7 @@ function SplashScreen({ onStart }) {
         <div className="splash-logo">GET SHIT <span className="lime">DONE!</span></div>
         <div style={{ marginTop: 14, color: "var(--lime)", fontFamily: "JetBrains Mono", fontSize: 11, letterSpacing: "0.3em", opacity: 0.8 }}>⚡ V3.0 ⚡</div>
         <p className="splash-tag" style={{ marginTop: 18, marginBottom: 22 }}>
-          Tasks. Termine. Sport. Habits.<br />Alles in einem. Auf den Punkt.
+          Mach jetzt endlich dein Scheiß fertig, Junge!
         </p>
         <button className="btn btn-primary" onClick={onStart} style={{ width: "100%", padding: 18, fontSize: 16, fontFamily: "Anton", letterSpacing: "0.08em" }}>
           ⚡ LET'S GET SHIT DONE
@@ -1599,6 +1677,50 @@ function SettingsModal({ state, dispatch, onClose }) {
             </div>
           )}
 
+          {/* Daily digest */}
+          {state.settings.notifications && (
+            <div className="card-sm">
+              <div className="between" onClick={() => dispatch({ type: "UPD_SETTINGS", payload: { dailyDigest: !state.settings.dailyDigest } })} style={{ cursor: "pointer" }}>
+                <div>
+                  <div style={{ fontWeight: 600, fontSize: 14 }}>📰 Tageszusammenfassung</div>
+                  <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 2 }}>
+                    {state.settings.dailyDigest ? `Täglich um ${state.settings.dailyDigestTime || "07:00"}` : "Aus"}
+                  </div>
+                </div>
+                <span className={`chk ${state.settings.dailyDigest ? "on" : ""}`}>{state.settings.dailyDigest && <Check size={12} color="#000" strokeWidth={3} />}</span>
+              </div>
+              {state.settings.dailyDigest && (
+                <>
+                  <div style={{ borderTop: "1px solid var(--border)", margin: "10px 0 8px", opacity: 0.5 }} />
+                  <div className="row" style={{ gap: 8, alignItems: "center", marginBottom: 8 }}>
+                    <span style={{ fontSize: 13, flex: 1 }}>⏰ Uhrzeit</span>
+                    <input
+                      type="time"
+                      className="input"
+                      value={state.settings.dailyDigestTime || "07:00"}
+                      onChange={e => dispatch({ type: "UPD_SETTINGS", payload: { dailyDigestTime: e.target.value } })}
+                      style={{ width: 110, padding: "6px 10px", fontSize: 13 }}
+                    />
+                  </div>
+                  <button
+                    className="btn btn-ghost"
+                    onClick={() => {
+                      const today = localDate();
+                      const { title, body } = buildDigestBody(state, today);
+                      Notif.fireNow({ title, body });
+                    }}
+                    style={{ width: "100%", padding: "8px 12px", fontSize: 12 }}
+                  >
+                    🧪 Test-Nachricht senden
+                  </button>
+                  <div style={{ fontSize: 10, color: "var(--muted)", marginTop: 8, lineHeight: 1.4 }}>
+                    Komplette Liste aller Termine, Aufgaben, Sport- und Habit-Einträge des Tages. Im Browser nur bei geöffneter App, in der APK auch im Hintergrund.
+                  </div>
+                </>
+              )}
+            </div>
+          )}
+
           {/* Daten / Backup */}
           <div className="section-title">💾 Daten & Backup</div>
           <button className="btn btn-primary" onClick={exportData}><Download size={14} /> Backup exportieren</button>
@@ -1699,8 +1821,9 @@ function DailyRitualModal({ tasks, dispatch, onClose }) {
 // ════════════════════════════════════════════════════════════════════════════
 // VIEWS
 // ════════════════════════════════════════════════════════════════════════════
-function DashboardView({ state, dispatch, openTask, openPomo, setShowRitual }) {
+function DashboardView({ state, dispatch, openTask, openEvent, openPomo, setShowRitual }) {
   const today = localDate();
+  const todayWeekday = (new Date().getDay() + 6) % 7;
   const todayTasks = state.tasks.filter(t => getTaskDates(t, today, today).includes(today) && t.status !== "done");
   const frog = state.tasks.find(t => t.isFrog && t.status !== "done");
   const doneToday = state.tasks.filter(t => t.completedAt && localDate(new Date(t.completedAt)) === today).length;
@@ -1725,11 +1848,31 @@ function DashboardView({ state, dispatch, openTask, openPomo, setShowRitual }) {
   });
   const ritualDoneToday = state.settings.dailyRitualDate === today;
   const todayEvents = state.events.filter(e => getEventDates(e, today, today).includes(today));
+  const todayWorkouts = state.workouts.filter(w => w.weekday === todayWeekday);
+  const todayHabits = (state.habits || []).filter(h => {
+    if (h.frequency === "daily") {
+      if (!h.weekdays || h.weekdays.length === 0) return true;
+      return h.weekdays.includes(todayWeekday);
+    }
+    return false;
+  });
+  // Build unified today-list, sorted by time. Items without time first.
+  const todayItems = [
+    ...todayEvents.map(e => ({ kind: "event", item: e, time: e.startTime || "", id: `e-${e.id}` })),
+    ...todayTasks.map(t => ({ kind: "task", item: t, time: t.startTime || "", id: `t-${t.id}` })),
+    ...todayWorkouts.map(w => ({ kind: "workout", item: w, time: w.time || "", id: `w-${w.id}` })),
+    ...todayHabits.map(h => ({ kind: "habit", item: h, time: "", id: `h-${h.id}` })),
+  ].sort((a, b) => {
+    if (!a.time && b.time) return -1;
+    if (a.time && !b.time) return 1;
+    return (a.time || "").localeCompare(b.time || "");
+  });
   const handleQuickComplete = (id, ev) => {
     ev.stopPropagation();
     dispatch({ type: "MOVE_TASK", payload: { id, status: "done" } });
     fireCelebration();
   };
+  const toggleHabit = (id) => dispatch({ type: "TOGGLE_HABIT", payload: { id, date: today } });
 
   return (
     <div className="view">
@@ -1746,54 +1889,83 @@ function DashboardView({ state, dispatch, openTask, openPomo, setShowRitual }) {
       {!ritualDoneToday && (
         <div className="card-lime" style={{ marginBottom: 12, cursor: "pointer" }} onClick={() => setShowRitual(true)}>
           <div className="between">
-            <div><div className="stat-label" style={{ color: "#000" }}>⚡ Daily Plan</div>
-              <div style={{ fontSize: 14, fontWeight: 700, color: "#000", marginTop: 2 }}>Was ist heute wichtig?</div></div>
-            <ChevronRight size={20} color="#000" />
+            <div><div className="stat-label" style={{ color: "#fff" }}>⚡ Daily Plan</div>
+              <div style={{ fontSize: 14, fontWeight: 700, color: "#fff", marginTop: 2 }}>Was ist heute wichtig?</div></div>
+            <ChevronRight size={20} color="#fff" />
           </div>
         </div>
       )}
 
-      {/* 2. Termine heute */}
-      {todayEvents.length > 0 && (
+      {/* 2. ALLES heute */}
+      {todayItems.length > 0 && (
         <>
-          <div className="section-title">📅 Heute · Termine</div>
-          {todayEvents.map(e => {
-            const t = eventTypeOf(e.type);
-            return (
-              <div key={e.id} className="card-sm" style={{ marginBottom: 6, borderLeft: `3px solid ${e.color}` }}>
-                <div className="between">
-                  <div className="row" style={{ flex: 1, minWidth: 0 }}>
-                    {e.isHoliday ? <span style={{ fontSize: 14 }}>🎉</span> : <t.icon size={14} color={e.color} />}
-                    <span style={{ fontSize: 13, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{e.title}</span>
+          <div className="section-title">⚡ Heute · {todayItems.length} {todayItems.length === 1 ? "Eintrag" : "Einträge"}</div>
+          {todayItems.map(it => {
+            if (it.kind === "event") {
+              const e = it.item;
+              const eType = eventTypeOf(e.type);
+              return (
+                <div key={it.id} onClick={() => !e.isHoliday && openEvent && openEvent(e.id)} className="card-sm" style={{ marginBottom: 6, cursor: e.isHoliday ? "default" : "pointer", borderLeft: `3px solid ${e.color}` }}>
+                  <div className="between">
+                    <div className="row" style={{ flex: 1, minWidth: 0 }}>
+                      {e.isHoliday ? <span style={{ fontSize: 14 }}>🎉</span> : <eType.icon size={14} color={e.color} />}
+                      <span style={{ fontSize: 13, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{e.title}</span>
+                    </div>
+                    {e.startTime && <span className="mono" style={{ fontSize: 11, color: "var(--muted)" }}>{e.startTime}</span>}
                   </div>
-                  {e.startTime && <span className="mono" style={{ fontSize: 11, color: "var(--muted)" }}>{e.startTime}</span>}
                 </div>
-              </div>
-            );
+              );
+            }
+            if (it.kind === "task") {
+              const t = it.item;
+              return (
+                <div key={it.id} onClick={() => openTask(t.id)} className="card-sm" style={{ marginBottom: 6, cursor: "pointer", borderLeft: `3px solid ${catOf(t.category).color}` }}>
+                  <div className="between">
+                    <div className="row" style={{ flex: 1, minWidth: 0 }}>
+                      <span className="chk round" onClick={ev => handleQuickComplete(t.id, ev)} style={{ width: 18, height: 18 }}></span>
+                      <div className={`prio-dot ${prioOf(t.priority).className}`} />
+                      <span style={{ fontSize: 13, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1 }}>{t.isFrog && "💩 "}{t.title}</span>
+                    </div>
+                    {t.startTime && <span className="mono" style={{ fontSize: 11, color: "var(--muted)" }}>{t.startTime}</span>}
+                  </div>
+                </div>
+              );
+            }
+            if (it.kind === "workout") {
+              const w = it.item;
+              return (
+                <div key={it.id} className="card-sm" style={{ marginBottom: 6, borderLeft: `3px solid ${w.color}` }}>
+                  <div className="between">
+                    <div className="row" style={{ flex: 1, minWidth: 0 }}>
+                      <Dumbbell size={14} color={w.color} />
+                      <span style={{ fontSize: 13, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>💪 {w.title}</span>
+                    </div>
+                    {w.time && <span className="mono" style={{ fontSize: 11, color: "var(--muted)" }}>{w.time}</span>}
+                  </div>
+                </div>
+              );
+            }
+            if (it.kind === "habit") {
+              const hb = it.item;
+              const done = !!(hb.completions || {})[today];
+              return (
+                <div key={it.id} onClick={() => toggleHabit(hb.id)} className="card-sm" style={{ marginBottom: 6, cursor: "pointer", borderLeft: `3px solid ${hb.color}` }}>
+                  <div className="between">
+                    <div className="row" style={{ flex: 1, minWidth: 0 }}>
+                      <span style={{ fontSize: 14 }}>{hb.emoji}</span>
+                      <span style={{ fontSize: 13, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", textDecoration: done ? "line-through" : "none", opacity: done ? 0.55 : 1 }}>{hb.title}</span>
+                    </div>
+                    <span className={`chk ${done ? "on" : ""}`}>{done && <Check size={12} color="#000" strokeWidth={3} />}</span>
+                  </div>
+                </div>
+              );
+            }
+            return null;
           })}
         </>
       )}
 
-      {/* 3. Aufgaben heute */}
-      {todayTasks.length > 0 && (
-        <>
-          <div className="section-title">⚡ Heute · {todayTasks.length} Aufgaben</div>
-          {todayTasks.slice(0, 6).map(t => (
-            <div key={t.id} onClick={() => openTask(t.id)} className="card-sm" style={{ marginBottom: 6, cursor: "pointer", borderLeft: `3px solid ${catOf(t.category).color}` }}>
-              <div className="between">
-                <div className="row" style={{ flex: 1, minWidth: 0 }}>
-                  <span className="chk round" onClick={ev => handleQuickComplete(t.id, ev)} style={{ width: 18, height: 18 }}></span>
-                  <div className={`prio-dot ${prioOf(t.priority).className}`} />
-                  <span style={{ fontSize: 13, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1 }}>{t.title}</span>
-                </div>
-                {t.startTime && <span className="mono" style={{ fontSize: 11, color: "var(--muted)" }}>{t.startTime}</span>}
-              </div>
-            </div>
-          ))}
-        </>
-      )}
-
-      {/* 4. Shit of the Day */}
+      {/* 3. Shit of the Day */}
       {frog && (
         <div onClick={() => openTask(frog.id)} className="card" style={{ marginTop: 12, marginBottom: 12, cursor: "pointer", borderLeft: "3px solid var(--lime)" }}>
           <div className="row">
@@ -1805,7 +1977,7 @@ function DashboardView({ state, dispatch, openTask, openPomo, setShowRitual }) {
         </div>
       )}
 
-      {todayTasks.length === 0 && !frog && todayEvents.length === 0 && (
+      {todayItems.length === 0 && !frog && (
         <div className="empty"><Sparkles size={32} className="empty-icon" /><p>Heute steht nichts an. ⚡</p></div>
       )}
 
@@ -2988,7 +3160,7 @@ export default function App() {
     }
   }, [loaded]);
 
-  useNotifications(state.tasks, state.events, state.workouts, state.habits, state.settings);
+  useNotifications(state);
 
   const taskDetail = openTaskId ? state.tasks.find(t => t.id === openTaskId) : null;
   const eventDetail = openEventId ? state.events.find(e => e.id === openEventId) : null;
@@ -3029,7 +3201,7 @@ export default function App() {
         </div>
 
         <div className="main">
-          {state.view === "dashboard" && <DashboardView state={state} dispatch={dispatch} openTask={openTask} openPomo={openPomo} setShowRitual={setShowRitual} />}
+          {state.view === "dashboard" && <DashboardView state={state} dispatch={dispatch} openTask={openTask} openEvent={openEvent} openPomo={openPomo} setShowRitual={setShowRitual} />}
           {state.view === "tasks" && <TasksView state={state} dispatch={dispatch} openTask={openTask} />}
           {state.view === "calendar" && <CalendarView state={state} dispatch={dispatch} openTask={openTask} openEvent={openEvent} setShowAddEvent={setShowAddEvent} />}
           {state.view === "sport" && <SportView state={state} dispatch={dispatch} setShowAddWorkout={setShowAddWorkout} />}
