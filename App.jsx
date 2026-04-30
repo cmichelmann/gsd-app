@@ -221,7 +221,7 @@ html, body, #root { height: 100%; background: #000; color: var(--text); overflow
 // ════════════════════════════════════════════════════════════════════════════
 // SCHEMA & MIGRATIONS
 // ════════════════════════════════════════════════════════════════════════════
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
 const STORAGE_KEY = "gsd-data";
 
 // localStorage wrapper that mimics Claude's window.storage API
@@ -258,9 +258,12 @@ function getDefaults() {
   return {
     version: SCHEMA_VERSION,
     meta: { deviceId: uid(), createdAt: nowIso(), lastModified: nowIso() },
-    settings: { notifications: false, userName: "", dailyRitualDate: null, onboarded: false, lastRolloverDate: null },
+    settings: {
+      notifications: false, userName: "", dailyRitualDate: null, onboarded: false, lastRolloverDate: null,
+      notifTasks: true, notifEvents: true, notifBirthdays: true, notifWorkouts: true, notifHabits: false,
+    },
     tasks: [], events: [], workouts: [], projects: [], habits: [],
-    shoppingLists: [], goals: [], books: [], budget: [], meals: {},
+    shoppingLists: [], goals: [], books: [], budget: [], notes: [], meals: {},
     pomodoros: [], achievements: [],
   };
 }
@@ -289,6 +292,13 @@ const migrations = {
     events: d.events || [], workouts: d.workouts || [],
     settings: { onboarded: false, lastRolloverDate: null, ...(d.settings || {}) },
     tasks: (d.tasks || []).map(t => ({ ...t, recurrence: t.recurrence || null })),
+  }),
+  4: (d) => ({ ...d, version: 4,
+    notes: d.notes || [],
+    settings: {
+      notifTasks: true, notifEvents: true, notifBirthdays: true, notifWorkouts: true, notifHabits: false,
+      ...(d.settings || {}),
+    },
   }),
 };
 
@@ -333,8 +343,11 @@ function germanHolidays(year) {
 }
 
 function generateHolidayEvents() {
-  const y = new Date().getFullYear();
-  const all = [...germanHolidays(y), ...germanHolidays(y + 1)];
+  const startY = new Date().getFullYear();
+  const all = [];
+  for (let y = startY; y < startY + 10; y++) {
+    all.push(...germanHolidays(y));
+  }
   return all.map(h => ({
     id: `holiday-${h.date}`, title: h.name, type: "holiday",
     startDate: h.date, endDate: h.date, allDay: true, startTime: "", endTime: "",
@@ -505,7 +518,73 @@ function getWorkoutDates(w, winStart, winEnd) {
   return out;
 }
 
+// Habits — frequency "daily" → every day; if weekdays array exists, only those.
+function getHabitDates(h, winStart, winEnd) {
+  const out = [];
+  const start = new Date(winStart + "T12:00:00");
+  const end = new Date(winEnd + "T12:00:00");
+  const wds = h.weekdays && h.weekdays.length ? h.weekdays : null;
+  for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
+    if (h.frequency === "daily") {
+      if (!wds || wds.includes((d.getDay() + 6) % 7)) out.push(localDate(d));
+    }
+  }
+  return out;
+}
+
 function fireCelebration() { window.dispatchEvent(new CustomEvent("gsd:celebrate")); }
+
+// ════════════════════════════════════════════════════════════════════════════
+// NOTIFICATIONS — Web today, Capacitor-ready for APK build
+// ════════════════════════════════════════════════════════════════════════════
+// When running as APK with Capacitor, replace the body of these functions with
+// `import { LocalNotifications } from '@capacitor/local-notifications'`
+// and use LocalNotifications.schedule() / cancel() — same API shape.
+const Notif = {
+  isCapacitor: () => typeof window !== "undefined" && !!window.Capacitor,
+  async requestPermission() {
+    if (this.isCapacitor()) {
+      // const { LocalNotifications } = await import('@capacitor/local-notifications');
+      // return (await LocalNotifications.requestPermissions()).display === "granted";
+      return true;
+    }
+    if (typeof Notification === "undefined") return false;
+    if (Notification.permission === "granted") return true;
+    if (Notification.permission === "denied") return false;
+    const r = await Notification.requestPermission();
+    return r === "granted";
+  },
+  async schedule({ id, title, body, at, channelKey }) {
+    // channelKey: "tasks" | "events" | "birthdays" | "workouts" | "habits"
+    if (!at) return;
+    const delay = new Date(at).getTime() - Date.now();
+    if (delay < 0) return; // past — don't fire
+    if (this.isCapacitor()) {
+      // const { LocalNotifications } = await import('@capacitor/local-notifications');
+      // await LocalNotifications.schedule({ notifications: [{
+      //   id: typeof id === "number" ? id : Math.abs(hashCode(String(id))),
+      //   title, body, schedule: { at: new Date(at) },
+      //   extra: { channelKey }
+      // }] });
+      return;
+    }
+    // Web fallback: only works while page is open. Schedule via setTimeout.
+    if (typeof Notification === "undefined" || Notification.permission !== "granted") return;
+    if (delay > 2147483647) return; // setTimeout max
+    setTimeout(() => {
+      try { new Notification(title, { body, tag: String(id), icon: `${import.meta.env.BASE_URL}icon-192.png` }); } catch {}
+    }, delay);
+  },
+  async cancel(id) {
+    if (this.isCapacitor()) {
+      // const { LocalNotifications } = await import('@capacitor/local-notifications');
+      // await LocalNotifications.cancel({ notifications: [{ id: typeof id === "number" ? id : Math.abs(hashCode(String(id))) }] });
+      return;
+    }
+    // Web: timeouts can't be reliably cancelled by id without tracking — best effort
+  },
+};
+function hashCode(s) { let h = 0; for (let i = 0; i < s.length; i++) { h = ((h << 5) - h) + s.charCodeAt(i); h |= 0; } return h; }
 
 // ════════════════════════════════════════════════════════════════════════════
 // SEED DATA
@@ -662,8 +741,21 @@ function reducer(state, { type, payload }) {
     case "DEL_BOOK": return touch({ ...state, books: state.books.filter(b => b.id !== payload) });
     case "ADD_BUDGET": return touch({ ...state, budget: [payload, ...state.budget] });
     case "DEL_BUDGET": return touch({ ...state, budget: state.budget.filter(b => b.id !== payload) });
+    case "ADD_NOTE": return touch({ ...state, notes: [payload, ...(state.notes || [])] });
+    case "UPD_NOTE": return touch({ ...state, notes: (state.notes || []).map(n => n.id === payload.id ? { ...n, ...payload, updatedAt: Date.now() } : n) });
+    case "DEL_NOTE": return touch({ ...state, notes: (state.notes || []).filter(n => n.id !== payload) });
     case "SET_MEAL":   return touch({ ...state, meals: { ...state.meals, [payload.date]: { ...(state.meals[payload.date] || {}), [payload.slot]: payload.text } } });
     case "UPD_SETTINGS": return touch({ ...state, settings: { ...state.settings, ...payload } });
+    case "WIPE_USER_DATA": {
+      // Delete everything except holidays. Keeps settings and version.
+      const holidays = (state.events || []).filter(e => e.isHoliday);
+      return touch({
+        ...state,
+        tasks: [], events: holidays, workouts: [], projects: [], habits: [],
+        shoppingLists: [], goals: [], books: [], budget: [], notes: [], meals: {},
+        pomodoros: [], achievements: [],
+      });
+    }
     default: return state;
   }
 }
@@ -725,44 +817,63 @@ function useDragDrop(onDrop) {
   return { drag, startDrag };
 }
 
-function useNotifications(tasks, events, workouts, settings) {
+function useNotifications(tasks, events, workouts, habits, settings) {
   const scheduledRef = useRef(new Set());
   useEffect(() => {
-    if (!settings.notifications || typeof Notification === "undefined") return;
-    if (Notification.permission !== "granted") return;
-    const now = Date.now();
-    const schedule = (key, fireAt, title, body) => {
+    if (!settings.notifications) return;
+    const schedule = (key, fireAt, channelKey, title, body) => {
       if (scheduledRef.current.has(key)) return;
-      const delay = fireAt - now;
-      if (delay <= 0 || delay > 86400000 * 2) return;
+      if (fireAt <= Date.now()) return;
       scheduledRef.current.add(key);
-      setTimeout(() => { try { new Notification(title, { body }); } catch (e) {} }, delay);
+      Notif.schedule({ id: key, title, body, at: new Date(fireAt), channelKey });
     };
-    tasks.forEach(t => {
-      if (!t.startDate || !t.startTime || !t.reminderMinutes || t.status === "done") return;
-      const dueMs = new Date(`${t.startDate}T${t.startTime}:00`).getTime();
-      schedule(`task-${t.id}-${dueMs}`, dueMs - t.reminderMinutes * 60000, `⚡ ${t.title}`, `Beginnt um ${t.startTime} Uhr`);
-    });
-    events.forEach(e => {
+    // Tasks
+    if (settings.notifTasks) {
+      tasks.forEach(t => {
+        if (!t.startDate || !t.startTime || !t.reminderMinutes || t.status === "done") return;
+        const dueMs = new Date(`${t.startDate}T${t.startTime}:00`).getTime();
+        schedule(`task-${t.id}-${dueMs}`, dueMs - t.reminderMinutes * 60000, "tasks", `⚡ ${t.title}`, `Beginnt um ${t.startTime} Uhr`);
+      });
+    }
+    // Events / Birthdays
+    (events || []).forEach(e => {
       if (!e.startDate || !e.reminderMinutes || e.isHoliday) return;
+      const isBday = e.type === "birthday";
+      if (isBday && !settings.notifBirthdays) return;
+      if (!isBday && !settings.notifEvents) return;
       const time = e.startTime || "09:00";
       const dueMs = new Date(`${e.startDate}T${time}:00`).getTime();
-      const icon = e.type === "birthday" ? "🎂" : e.type === "vacation" ? "✈️" : "📅";
-      schedule(`event-${e.id}-${dueMs}`, dueMs - e.reminderMinutes * 60000, `${icon} ${e.title}`, e.notes || "Erinnerung");
+      const icon = isBday ? "🎂" : e.type === "vacation" ? "✈️" : "📅";
+      schedule(`event-${e.id}-${dueMs}`, dueMs - e.reminderMinutes * 60000, isBday ? "birthdays" : "events", `${icon} ${e.title}`, e.notes || "Erinnerung");
     });
-    const today = new Date();
-    workouts.forEach(w => {
-      if (!w.reminderMinutes) return;
-      for (let i = 0; i < 7; i++) {
-        const d = addDays(today, i);
-        if (((d.getDay() + 6) % 7) === w.weekday) {
-          const dateStr = localDate(d);
-          const dueMs = new Date(`${dateStr}T${w.time}:00`).getTime();
-          schedule(`workout-${w.id}-${dateStr}`, dueMs - w.reminderMinutes * 60000, `💪 ${w.title}`, `${workoutTypeOf(w.type).label} um ${w.time}`);
+    // Workouts (next 7 days)
+    if (settings.notifWorkouts) {
+      const today = new Date();
+      (workouts || []).forEach(w => {
+        if (!w.reminderMinutes) return;
+        for (let i = 0; i < 7; i++) {
+          const d = addDays(today, i);
+          if (((d.getDay() + 6) % 7) === w.weekday) {
+            const dateStr = localDate(d);
+            const dueMs = new Date(`${dateStr}T${w.time}:00`).getTime();
+            schedule(`workout-${w.id}-${dateStr}`, dueMs - w.reminderMinutes * 60000, "workouts", `💪 ${w.title}`, `${workoutTypeOf(w.type).label} um ${w.time}`);
+          }
         }
-      }
-    });
-  }, [tasks, events, workouts, settings.notifications]);
+      });
+    }
+    // Habits — daily 08:00 reminder for next 7 days
+    if (settings.notifHabits) {
+      const today = new Date();
+      (habits || []).forEach(h => {
+        for (let i = 0; i < 7; i++) {
+          const d = addDays(today, i);
+          const dateStr = localDate(d);
+          const dueMs = new Date(`${dateStr}T08:00:00`).getTime();
+          schedule(`habit-${h.id}-${dateStr}`, dueMs, "habits", `${h.emoji || "🔥"} ${h.title}`, "Habit-Erinnerung");
+        }
+      });
+    }
+  }, [tasks, events, workouts, habits, settings.notifications, settings.notifTasks, settings.notifEvents, settings.notifBirthdays, settings.notifWorkouts, settings.notifHabits]);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1404,10 +1515,12 @@ function SearchModal({ tasks, events, onClose, openTask, openEvent }) {
 
 function SettingsModal({ state, dispatch, onClose }) {
   const [name, setName] = useState(state.settings.userName || "");
+  const [wipeStep, setWipeStep] = useState(0); // 0=hidden, 1=first confirm, 2=second
+  const [wipeText, setWipeText] = useState("");
   const enableNotifications = async () => {
-    if (typeof Notification === "undefined") { alert("Browser unterstützt keine Notifications"); return; }
-    const perm = await Notification.requestPermission();
-    if (perm === "granted") dispatch({ type: "UPD_SETTINGS", payload: { notifications: true } });
+    const ok = await Notif.requestPermission();
+    if (ok) dispatch({ type: "UPD_SETTINGS", payload: { notifications: true } });
+    else alert("Notifications wurden vom Browser/System nicht erlaubt.");
   };
   const disableNotifications = () => dispatch({ type: "UPD_SETTINGS", payload: { notifications: false } });
   const exportData = () => {
@@ -1428,6 +1541,19 @@ function SettingsModal({ state, dispatch, onClose }) {
     };
     reader.readAsText(file);
   };
+  const doWipe = () => {
+    dispatch({ type: "WIPE_USER_DATA" });
+    setWipeStep(0);
+    setWipeText("");
+    alert("Alle Daten gelöscht. Feiertage bleiben erhalten.");
+  };
+  const NOTIF_CHANNELS = [
+    { key: "notifTasks", label: "Aufgaben", emoji: "✅" },
+    { key: "notifEvents", label: "Termine", emoji: "📅" },
+    { key: "notifBirthdays", label: "Geburtstage", emoji: "🎂" },
+    { key: "notifWorkouts", label: "Sport / Training", emoji: "💪" },
+    { key: "notifHabits", label: "Habits", emoji: "🔥" },
+  ];
   return (
     <div className="overlay" onClick={e => e.target === e.currentTarget && onClose()}>
       <div className="modal">
@@ -1439,26 +1565,85 @@ function SettingsModal({ state, dispatch, onClose }) {
         <div className="col" style={{ gap: 12 }}>
           <div><label className="label">Dein Name</label>
             <input className="input" value={name} onChange={e => setName(e.target.value)} onBlur={() => dispatch({ type: "UPD_SETTINGS", payload: { userName: name } })} placeholder="Wie soll ich dich nennen?" /></div>
+
+          {/* Notifications master switch */}
+          <div className="section-title">🔔 Benachrichtigungen</div>
           <div className="card-sm">
             <div className="between">
-              <div><div style={{ fontWeight: 600, fontSize: 14 }}>🔔 Push-Benachrichtigungen</div>
+              <div><div style={{ fontWeight: 600, fontSize: 14 }}>Push-Benachrichtigungen</div>
                 <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 2 }}>{state.settings.notifications ? "Aktiviert" : "Deaktiviert"}</div></div>
               {state.settings.notifications
                 ? <button className="btn btn-ghost" onClick={disableNotifications} style={{ padding: "6px 12px", fontSize: 12 }}>Aus</button>
                 : <button className="btn btn-primary" onClick={enableNotifications} style={{ padding: "6px 12px", fontSize: 12 }}>Aktivieren</button>}
             </div>
-            <div style={{ fontSize: 10, color: "var(--muted)", marginTop: 8, lineHeight: 1.4 }}>Notifications funktionieren nur bei geöffneter App. Native Android App nötig für Background.</div>
+            <div style={{ fontSize: 10, color: "var(--muted)", marginTop: 8, lineHeight: 1.4 }}>
+              Im Browser nur bei geöffneter App. Für Hintergrund-Benachrichtigungen brauchst du die Android-APK (Capacitor).
+            </div>
           </div>
-          <div className="section-title">Daten</div>
-          <button className="btn btn-ghost" onClick={exportData}><Download size={14} /> Backup exportieren</button>
+
+          {/* Per-channel toggles */}
+          {state.settings.notifications && (
+            <div className="card-sm">
+              <div className="stat-label" style={{ marginBottom: 8 }}>Was soll dich erinnern?</div>
+              <div className="col" style={{ gap: 6 }}>
+                {NOTIF_CHANNELS.map(ch => {
+                  const on = !!state.settings[ch.key];
+                  return (
+                    <div key={ch.key} className="between" onClick={() => dispatch({ type: "UPD_SETTINGS", payload: { [ch.key]: !on } })} style={{ cursor: "pointer", padding: "6px 0" }}>
+                      <span style={{ fontSize: 13 }}>{ch.emoji} {ch.label}</span>
+                      <span className={`chk ${on ? "on" : ""}`}>{on && <Check size={12} color="#000" strokeWidth={3} />}</span>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* Daten / Backup */}
+          <div className="section-title">💾 Daten & Backup</div>
+          <button className="btn btn-primary" onClick={exportData}><Download size={14} /> Backup exportieren</button>
           <label className="btn btn-ghost" style={{ cursor: "pointer" }}>
             <Upload size={14} /> Backup importieren
             <input type="file" accept=".json" onChange={e => e.target.files[0] && importData(e.target.files[0])} style={{ display: "none" }} />
           </label>
           <div className="card-sm">
             <div className="stat-label">Schema-Version</div>
-            <div className="mono" style={{ fontSize: 12, marginTop: 4 }}>v{state.version} · {state.tasks.length} Tasks · {state.events.length} Events · {state.workouts.length} Workouts · {state.habits.length} Habits</div>
+            <div className="mono" style={{ fontSize: 12, marginTop: 4 }}>v{state.version} · {state.tasks.length} Tasks · {state.events.length} Events · {state.workouts.length} Workouts · {state.habits.length} Habits · {(state.notes||[]).length} Notizen</div>
           </div>
+
+          {/* Wipe (versteckt) */}
+          <div className="section-title" style={{ marginTop: 8 }}>⚠️ Gefahrenzone</div>
+          {wipeStep === 0 && (
+            <button className="btn btn-ghost" onClick={() => setWipeStep(1)} style={{ color: "#FF3B3B", borderColor: "#FF3B3B33" }}>
+              🗑️ Alle Daten löschen
+            </button>
+          )}
+          {wipeStep === 1 && (
+            <div className="card" style={{ borderColor: "#FF3B3B" }}>
+              <div style={{ fontSize: 14, fontWeight: 700, color: "#FF3B3B", marginBottom: 6 }}>Wirklich alles löschen?</div>
+              <div style={{ fontSize: 12, color: "var(--muted)", marginBottom: 10, lineHeight: 1.5 }}>
+                Das löscht <b>alle Aufgaben, Termine, Geburtstage, Workouts, Habits, Listen, Notizen, Bücher, Ziele, Mahlzeiten und Pomodoros</b>.<br/>
+                Feiertage bleiben erhalten.<br/>
+                <b>Diese Aktion kann nicht rückgängig gemacht werden.</b>
+              </div>
+              <div className="row" style={{ gap: 8 }}>
+                <button className="btn btn-ghost" onClick={() => setWipeStep(0)} style={{ flex: 1 }}>Abbrechen</button>
+                <button className="btn btn-danger" onClick={() => setWipeStep(2)} style={{ flex: 2 }}>Ich verstehe, weiter</button>
+              </div>
+            </div>
+          )}
+          {wipeStep === 2 && (
+            <div className="card" style={{ borderColor: "#FF3B3B" }}>
+              <div style={{ fontSize: 13, marginBottom: 8 }}>Tippe <b style={{ color: "#FF3B3B" }}>LÖSCHEN</b> ein um zu bestätigen:</div>
+              <input className="input" value={wipeText} onChange={e => setWipeText(e.target.value)} autoFocus style={{ marginBottom: 10, borderColor: wipeText === "LÖSCHEN" ? "#FF3B3B" : "var(--border)" }} placeholder="LÖSCHEN" />
+              <div className="row" style={{ gap: 8 }}>
+                <button className="btn btn-ghost" onClick={() => { setWipeStep(0); setWipeText(""); }} style={{ flex: 1 }}>Abbrechen</button>
+                <button className="btn btn-danger" disabled={wipeText !== "LÖSCHEN"} onClick={doWipe} style={{ flex: 2, opacity: wipeText === "LÖSCHEN" ? 1 : 0.4 }}>
+                  🗑️ Endgültig löschen
+                </button>
+              </div>
+            </div>
+          )}
         </div>
       </div>
     </div>
@@ -1556,6 +1741,8 @@ function DashboardView({ state, dispatch, openTask, openPomo, setShowRitual }) {
           GUTEN {greet}<span style={{ color: "var(--lime)" }}>{name}</span>
         </h1>
       </div>
+
+      {/* 1. Daily Plan */}
       {!ritualDoneToday && (
         <div className="card-lime" style={{ marginBottom: 12, cursor: "pointer" }} onClick={() => setShowRitual(true)}>
           <div className="between">
@@ -1565,46 +1752,8 @@ function DashboardView({ state, dispatch, openTask, openPomo, setShowRitual }) {
           </div>
         </div>
       )}
-      <div className="stat-grid" style={{ marginBottom: 8 }}>
-        <div className="stat-tile"><div className="stat-label">Heute fertig</div>
-          <div className="stat-val" style={{ color: "var(--lime)" }}>{doneToday}</div></div>
-        <div className="stat-tile"><div className="stat-label">🔥 Streak</div>
-          <div className="stat-val">{streak}<span style={{ fontSize: 11, color: "var(--muted)", marginLeft: 4 }}>Tg</span></div></div>
-        <div className="stat-tile"><div className="stat-label">Pomodoros</div>
-          <div className="stat-val">{pomosToday}<span style={{ fontSize: 11, color: "var(--muted)", marginLeft: 3 }}>×25m</span></div></div>
-        <div className="stat-tile"><div className="stat-label">Habits</div>
-          <div className="stat-val">{habitsToday}<span style={{ fontSize: 11, color: "var(--muted)", marginLeft: 4 }}>/{state.habits.length}</span></div></div>
-      </div>
-      <div className="stat-grid" style={{ marginBottom: 14 }}>
-        <div className="stat-tile"><div className="stat-label">Heute geplant</div><div className="stat-val">{todayTasks.length}</div></div>
-        <div className="stat-tile"><div className="stat-label">Quote</div>
-          <div className="stat-val">{Math.round(doneAll/total*100)}<span style={{ fontSize: 11, color: "var(--muted)" }}>%</span></div></div>
-      </div>
-      <div className="card" style={{ marginBottom: 14 }}>
-        <div className="stat-label" style={{ marginBottom: 10 }}>Letzte 7 Tage</div>
-        <ResponsiveContainer width="100%" height={88}>
-          <AreaChart data={chart7} margin={{ top: 4, right: 0, left: -24, bottom: 0 }}>
-            <defs><linearGradient id="ag" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="5%" stopColor="#AAFF00" stopOpacity={0.5} />
-              <stop offset="95%" stopColor="#AAFF00" stopOpacity={0} />
-            </linearGradient></defs>
-            <XAxis dataKey="day" tick={{ fill: "#707070", fontSize: 10 }} axisLine={false} tickLine={false} />
-            <YAxis tick={{ fill: "#707070", fontSize: 10 }} axisLine={false} tickLine={false} allowDecimals={false} />
-            <Tooltip contentStyle={{ background: "var(--s1)", border: "1px solid var(--border2)", borderRadius: 8, fontSize: 11 }} />
-            <Area type="monotone" dataKey="done" stroke="#AAFF00" strokeWidth={2} fill="url(#ag)" dot={{ fill: "#AAFF00", r: 3, strokeWidth: 0 }} />
-          </AreaChart>
-        </ResponsiveContainer>
-      </div>
-      {frog && (
-        <div onClick={() => openTask(frog.id)} className="card" style={{ marginBottom: 12, cursor: "pointer", borderLeft: "3px solid var(--lime)" }}>
-          <div className="row">
-            <span style={{ fontSize: 28 }}>💩</span>
-            <div style={{ flex: 1 }}><div className="stat-label">Shit of the Day</div>
-              <div style={{ fontSize: 14, fontWeight: 600, marginTop: 2 }}>{frog.title}</div></div>
-            <ChevronRight size={18} color="var(--muted)" />
-          </div>
-        </div>
-      )}
+
+      {/* 2. Termine heute */}
       {todayEvents.length > 0 && (
         <>
           <div className="section-title">📅 Heute · Termine</div>
@@ -1624,6 +1773,8 @@ function DashboardView({ state, dispatch, openTask, openPomo, setShowRitual }) {
           })}
         </>
       )}
+
+      {/* 3. Aufgaben heute */}
       {todayTasks.length > 0 && (
         <>
           <div className="section-title">⚡ Heute · {todayTasks.length} Aufgaben</div>
@@ -1641,9 +1792,56 @@ function DashboardView({ state, dispatch, openTask, openPomo, setShowRitual }) {
           ))}
         </>
       )}
+
+      {/* 4. Shit of the Day */}
+      {frog && (
+        <div onClick={() => openTask(frog.id)} className="card" style={{ marginTop: 12, marginBottom: 12, cursor: "pointer", borderLeft: "3px solid var(--lime)" }}>
+          <div className="row">
+            <span style={{ fontSize: 28 }}>💩</span>
+            <div style={{ flex: 1 }}><div className="stat-label">Shit of the Day</div>
+              <div style={{ fontSize: 14, fontWeight: 600, marginTop: 2 }}>{frog.title}</div></div>
+            <ChevronRight size={18} color="var(--muted)" />
+          </div>
+        </div>
+      )}
+
       {todayTasks.length === 0 && !frog && todayEvents.length === 0 && (
         <div className="empty"><Sparkles size={32} className="empty-icon" /><p>Heute steht nichts an. ⚡</p></div>
       )}
+
+      {/* 5. Stats */}
+      <div className="stat-grid" style={{ marginBottom: 8, marginTop: 16 }}>
+        <div className="stat-tile"><div className="stat-label">Heute fertig</div>
+          <div className="stat-val" style={{ color: "var(--lime)" }}>{doneToday}</div></div>
+        <div className="stat-tile"><div className="stat-label">🔥 Streak</div>
+          <div className="stat-val">{streak}<span style={{ fontSize: 11, color: "var(--muted)", marginLeft: 4 }}>Tg</span></div></div>
+        <div className="stat-tile"><div className="stat-label">Pomodoros</div>
+          <div className="stat-val">{pomosToday}<span style={{ fontSize: 11, color: "var(--muted)", marginLeft: 3 }}>×25m</span></div></div>
+        <div className="stat-tile"><div className="stat-label">Habits</div>
+          <div className="stat-val">{habitsToday}<span style={{ fontSize: 11, color: "var(--muted)", marginLeft: 4 }}>/{state.habits.length}</span></div></div>
+      </div>
+      <div className="stat-grid" style={{ marginBottom: 14 }}>
+        <div className="stat-tile"><div className="stat-label">Heute geplant</div><div className="stat-val">{todayTasks.length}</div></div>
+        <div className="stat-tile"><div className="stat-label">Quote</div>
+          <div className="stat-val">{Math.round(doneAll/total*100)}<span style={{ fontSize: 11, color: "var(--muted)" }}>%</span></div></div>
+      </div>
+
+      {/* 6. Chart */}
+      <div className="card" style={{ marginBottom: 14 }}>
+        <div className="stat-label" style={{ marginBottom: 10 }}>Letzte 7 Tage</div>
+        <ResponsiveContainer width="100%" height={88}>
+          <AreaChart data={chart7} margin={{ top: 4, right: 0, left: -24, bottom: 0 }}>
+            <defs><linearGradient id="ag" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="5%" stopColor="#AAFF00" stopOpacity={0.5} />
+              <stop offset="95%" stopColor="#AAFF00" stopOpacity={0} />
+            </linearGradient></defs>
+            <XAxis dataKey="day" tick={{ fill: "#707070", fontSize: 10 }} axisLine={false} tickLine={false} />
+            <YAxis tick={{ fill: "#707070", fontSize: 10 }} axisLine={false} tickLine={false} allowDecimals={false} />
+            <Tooltip contentStyle={{ background: "var(--s1)", border: "1px solid var(--border2)", borderRadius: 8, fontSize: 11 }} />
+            <Area type="monotone" dataKey="done" stroke="#AAFF00" strokeWidth={2} fill="url(#ag)" dot={{ fill: "#AAFF00", r: 3, strokeWidth: 0 }} />
+          </AreaChart>
+        </ResponsiveContainer>
+      </div>
     </div>
   );
 }
@@ -1747,15 +1945,16 @@ function CalendarView({ state, dispatch, openTask, openEvent, setShowAddEvent })
         <button className={`cal-tab ${tab === "week" ? "active" : ""}`} onClick={() => setTab("week")}>Woche</button>
         <button className={`cal-tab ${tab === "gantt" ? "active" : ""}`} onClick={() => setTab("gantt")}>Gantt</button>
       </div>
-      {tab === "month" && <MonthView state={state} openTask={openTask} openEvent={openEvent} />}
-      {tab === "week" && <WeekListView state={state} openTask={openTask} openEvent={openEvent} />}
-      {tab === "gantt" && <GanttView state={state} openTask={openTask} />}
+      {tab === "month" && <MonthView state={state} dispatch={dispatch} openTask={openTask} openEvent={openEvent} />}
+      {tab === "week" && <WeekListView state={state} dispatch={dispatch} openTask={openTask} openEvent={openEvent} />}
+      {tab === "gantt" && <GanttView state={state} dispatch={dispatch} openTask={openTask} openEvent={openEvent} />}
     </div>
   );
 }
 
-function MonthView({ state, openTask, openEvent }) {
+function MonthView({ state, dispatch, openTask, openEvent }) {
   const [offset, setOffset] = useState(0);
+  const [selectedDate, setSelectedDate] = useState(null);
   const today = localDate();
   const now = new Date();
   const target = new Date(now.getFullYear(), now.getMonth() + offset, 1);
@@ -1767,8 +1966,9 @@ function MonthView({ state, openTask, openEvent }) {
     state.tasks.forEach(t => getTaskDates(t, winStart, winEnd).forEach(d => { (m[d] = m[d] || []).push({ kind: "task", item: t }); }));
     state.events.forEach(e => getEventDates(e, winStart, winEnd).forEach(d => { (m[d] = m[d] || []).push({ kind: "event", item: e }); }));
     state.workouts.forEach(w => getWorkoutDates(w, winStart, winEnd).forEach(d => { (m[d] = m[d] || []).push({ kind: "workout", item: w }); }));
+    (state.habits || []).forEach(h => getHabitDates(h, winStart, winEnd).forEach(d => { (m[d] = m[d] || []).push({ kind: "habit", item: h }); }));
     return m;
-  }, [state.tasks, state.events, state.workouts, winStart, winEnd]);
+  }, [state.tasks, state.events, state.workouts, state.habits, winStart, winEnd]);
   return (
     <div>
       <div className="between" style={{ marginBottom: 10 }}>
@@ -1786,9 +1986,9 @@ function MonthView({ state, openTask, openEvent }) {
           const hasHoliday = items.some(it => it.kind === "event" && it.item.isHoliday);
           const isToday = ds === today;
           return (
-            <div key={i} className={`month-day ${isToday ? "today" : ""} ${c.otherMonth ? "other-month" : ""} ${hasHoliday ? "holiday" : ""}`}>
+            <div key={i} className={`month-day ${isToday ? "today" : ""} ${c.otherMonth ? "other-month" : ""} ${hasHoliday ? "holiday" : ""}`} onClick={() => setSelectedDate(ds)}>
               <div className="day-num">{c.day}</div>
-              <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+              <div style={{ display: "flex", flexDirection: "column", gap: 1 }}>
                 {items.slice(0, 3).map((it, idx) => {
                   if (it.kind === "task") {
                     return <div key={idx} className="day-task-bar" onClick={(e) => { e.stopPropagation(); openTask(it.item.id); }} style={{ background: catOf(it.item.category).color }}>{it.item.title}</div>;
@@ -1796,11 +1996,13 @@ function MonthView({ state, openTask, openEvent }) {
                     return <div key={idx} className="day-task-bar" onClick={(e) => { e.stopPropagation(); openEvent(it.item.id); }} style={{ background: it.item.color, opacity: it.item.isHoliday ? 0.7 : 1 }}>
                       {it.item.isHoliday ? "🎉 " : it.item.type === "birthday" ? "🎂 " : it.item.type === "vacation" ? "✈️ " : ""}{it.item.title}
                     </div>;
+                  } else if (it.kind === "habit") {
+                    return <div key={idx} className="day-task-bar" style={{ background: it.item.color, opacity: 0.7 }} onClick={(e) => e.stopPropagation()}>{it.item.emoji} {it.item.title}</div>;
                   } else {
-                    return <div key={idx} className="day-task-bar" style={{ background: it.item.color, opacity: 0.85 }}>💪 {it.item.title}</div>;
+                    return <div key={idx} className="day-task-bar" style={{ background: it.item.color, opacity: 0.85 }} onClick={(e) => e.stopPropagation()}>💪 {it.item.title}</div>;
                   }
                 })}
-                {items.length > 3 && <div style={{ fontSize: 9, color: "var(--muted)", paddingLeft: 4 }}>+{items.length - 3}</div>}
+                {items.length > 3 && <div style={{ fontSize: 8, color: "var(--lime)", fontWeight: 700, paddingLeft: 2, cursor: "pointer" }}>+{items.length - 3} mehr</div>}
               </div>
             </div>
           );
@@ -1814,15 +2016,118 @@ function MonthView({ state, openTask, openEvent }) {
           </div>
         ))}
         <div className="row" style={{ gap: 4 }}>
-          <div style={{ width: 10, height: 10, background: "var(--orange)", borderRadius: 2 }} />
+          <div style={{ width: 10, height: 10, background: "#FF6B35", borderRadius: 2 }} />
           <span className="mono" style={{ fontSize: 10, color: "var(--muted)" }}>Feiertag</span>
         </div>
+      </div>
+      {selectedDate && (
+        <DayDetailModal
+          date={selectedDate}
+          items={itemsByDate[selectedDate] || []}
+          onClose={() => setSelectedDate(null)}
+          openTask={(id) => { setSelectedDate(null); openTask(id); }}
+          openEvent={(id) => { setSelectedDate(null); openEvent(id); }}
+          dispatch={dispatch}
+        />
+      )}
+    </div>
+  );
+}
+
+function DayDetailModal({ date, items, onClose, openTask, openEvent, dispatch }) {
+  const dt = new Date(date + "T12:00:00");
+  const dayLabel = `${DAYS_FULL[(dt.getDay() + 6) % 7]}, ${dt.getDate()}. ${MONTHS_DE[dt.getMonth()]}`;
+  const tasks = items.filter(i => i.kind === "task");
+  const events = items.filter(i => i.kind === "event");
+  const workouts = items.filter(i => i.kind === "workout");
+  const habits = items.filter(i => i.kind === "habit");
+  return (
+    <div className="overlay" onClick={e => e.target === e.currentTarget && onClose()}>
+      <div className="modal">
+        <div className="grip" />
+        <div className="between" style={{ marginBottom: 14 }}>
+          <h2 className="display" style={{ fontSize: 20 }}>{dayLabel}</h2>
+          <button onClick={onClose} className="btn btn-ghost btn-icon"><X size={18} /></button>
+        </div>
+        {items.length === 0 ? (
+          <div style={{ textAlign: "center", padding: 30, color: "var(--muted)" }}>Nichts an diesem Tag.</div>
+        ) : (
+          <div className="col" style={{ gap: 14 }}>
+            {events.length > 0 && (
+              <div>
+                <div className="stat-label" style={{ marginBottom: 6 }}>Termine</div>
+                <div className="col" style={{ gap: 6 }}>
+                  {events.map((it, i) => (
+                    <div key={`e-${i}`} className="card-sm" style={{ cursor: it.item.isHoliday ? "default" : "pointer", borderLeft: `3px solid ${it.item.color}` }} onClick={() => !it.item.isHoliday && openEvent(it.item.id)}>
+                      <div className="row" style={{ justifyContent: "space-between" }}>
+                        <span style={{ fontSize: 14 }}>
+                          {it.item.isHoliday ? "🎉 " : it.item.type === "birthday" ? "🎂 " : it.item.type === "vacation" ? "✈️ " : "📅 "}{it.item.title}
+                        </span>
+                        {it.item.startTime && <span className="mono" style={{ fontSize: 11, color: "var(--muted)" }}>{it.item.startTime}</span>}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+            {tasks.length > 0 && (
+              <div>
+                <div className="stat-label" style={{ marginBottom: 6 }}>Aufgaben</div>
+                <div className="col" style={{ gap: 6 }}>
+                  {tasks.map((it, i) => (
+                    <div key={`t-${i}`} className="card-sm" style={{ cursor: "pointer", borderLeft: `3px solid ${catOf(it.item.category).color}` }} onClick={() => openTask(it.item.id)}>
+                      <div className="row" style={{ justifyContent: "space-between" }}>
+                        <span style={{ fontSize: 14, textDecoration: it.item.status === "done" ? "line-through" : "none", opacity: it.item.status === "done" ? 0.55 : 1 }}>
+                          {it.item.isFrog && "💩 "}{it.item.title}
+                        </span>
+                        {it.item.startTime && <span className="mono" style={{ fontSize: 11, color: "var(--muted)" }}>{it.item.startTime}</span>}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+            {workouts.length > 0 && (
+              <div>
+                <div className="stat-label" style={{ marginBottom: 6 }}>Sport</div>
+                <div className="col" style={{ gap: 6 }}>
+                  {workouts.map((it, i) => (
+                    <div key={`w-${i}`} className="card-sm" style={{ borderLeft: `3px solid ${it.item.color}` }}>
+                      <div className="row" style={{ justifyContent: "space-between" }}>
+                        <span style={{ fontSize: 14 }}>💪 {it.item.title}</span>
+                        <span className="mono" style={{ fontSize: 11, color: "var(--muted)" }}>{it.item.time}</span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+            {habits.length > 0 && (
+              <div>
+                <div className="stat-label" style={{ marginBottom: 6 }}>Habits</div>
+                <div className="col" style={{ gap: 6 }}>
+                  {habits.map((it, i) => {
+                    const done = !!(it.item.completions || {})[date];
+                    return (
+                      <div key={`h-${i}`} className="card-sm" style={{ cursor: "pointer", borderLeft: `3px solid ${it.item.color}` }} onClick={() => dispatch && dispatch({ type: "TOGGLE_HABIT", payload: { id: it.item.id, date } })}>
+                        <div className="row" style={{ justifyContent: "space-between" }}>
+                          <span style={{ fontSize: 14, textDecoration: done ? "line-through" : "none", opacity: done ? 0.55 : 1 }}>{it.item.emoji} {it.item.title}</span>
+                          <span className={`chk ${done ? "on" : ""}`}>{done && <Check size={12} color="#000" strokeWidth={3} />}</span>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
       </div>
     </div>
   );
 }
 
-function WeekListView({ state, openTask, openEvent }) {
+function WeekListView({ state, dispatch, openTask, openEvent }) {
   const [offset, setOffset] = useState(0);
   const dates = weekDates(offset);
   const today = localDate();
@@ -1845,6 +2150,11 @@ function WeekListView({ state, openTask, openEvent }) {
         if (m[d]) m[d].push({ kind: "workout", item: w, time: w.time });
       });
     });
+    (state.habits || []).forEach(h => {
+      getHabitDates(h, winStart, winEnd).forEach(d => {
+        if (m[d]) m[d].push({ kind: "habit", item: h, time: "" });
+      });
+    });
     Object.keys(m).forEach(d => {
       m[d].sort((a, b) => {
         if (!a.time && b.time) return -1;
@@ -1853,7 +2163,7 @@ function WeekListView({ state, openTask, openEvent }) {
       });
     });
     return m;
-  }, [state.tasks, state.events, state.workouts, winStart, winEnd]);
+  }, [state.tasks, state.events, state.workouts, state.habits, winStart, winEnd]);
   const label = `${new Date(dates[0] + "T12:00:00").getDate()}. – ${new Date(dates[6] + "T12:00:00").getDate()}. ${MONTHS_DE[new Date(dates[6] + "T12:00:00").getMonth()]}`;
   return (
     <div>
@@ -1903,6 +2213,16 @@ function WeekListView({ state, openTask, openEvent }) {
                         {e.startTime && <span className="mono" style={{ fontSize: 11, color: "var(--muted)" }}>{e.startTime}</span>}
                       </div>
                     );
+                  } else if (it.kind === "habit") {
+                    const h = it.item;
+                    const done = !!(h.completions || {})[d];
+                    return (
+                      <div key={`h-${idx}`} className="row-item" onClick={() => dispatch && dispatch({ type: "TOGGLE_HABIT", payload: { id: h.id, date: d } })}>
+                        <span style={{ fontSize: 13, flexShrink: 0 }}>{h.emoji}</span>
+                        <span style={{ fontSize: 13, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", textDecoration: done ? "line-through" : "none", opacity: done ? 0.55 : 1 }}>{h.title}</span>
+                        <span className={`chk ${done ? "on" : ""}`} style={{ width: 16, height: 16 }}>{done && <Check size={10} color="#000" strokeWidth={3} />}</span>
+                      </div>
+                    );
                   } else {
                     const w = it.item;
                     return (
@@ -1923,13 +2243,18 @@ function WeekListView({ state, openTask, openEvent }) {
   );
 }
 
-function GanttView({ state, openTask }) {
+function GanttView({ state, dispatch, openTask, openEvent }) {
   const [offset, setOffset] = useState(0);
   const today = localDate();
   const start = new Date(); start.setDate(start.getDate() - ((start.getDay() + 6) % 7) + offset * 7);
   const days = Array.from({ length: 21 }, (_, i) => { const d = new Date(start); d.setDate(start.getDate() + i); return localDate(d); });
   const dayWidth = 40;
   const tasksWithDates = state.tasks.filter(t => t.startDate);
+  const eventsWithDates = (state.events || []).filter(e => e.startDate && !e.isHoliday);
+  const allBars = [
+    ...tasksWithDates.map(t => ({ id: t.id, kind: "task", title: t.title, startDate: t.startDate, endDate: t.endDate || t.startDate, color: catOf(t.category).color, faded: t.status === "done", item: t })),
+    ...eventsWithDates.map(e => ({ id: e.id, kind: "event", title: (e.type === "birthday" ? "🎂 " : e.type === "vacation" ? "✈️ " : "📅 ") + e.title, startDate: e.startDate, endDate: e.endDate || e.startDate, color: e.color, faded: false, item: e })),
+  ];
   const headerStart = new Date(days[0] + "T12:00:00");
   const headerEnd = new Date(days[days.length - 1] + "T12:00:00");
   const monthLabel = `${MONTHS_DE[headerStart.getMonth()].slice(0, 3)} ${headerStart.getDate()} – ${MONTHS_DE[headerEnd.getMonth()].slice(0, 3)} ${headerEnd.getDate()}`;
@@ -1940,13 +2265,13 @@ function GanttView({ state, openTask }) {
         <div className="display" style={{ fontSize: 13 }}>{monthLabel}</div>
         <button className="btn btn-ghost btn-icon" onClick={() => setOffset(o => o + 1)}><ChevronRight size={16} /></button>
       </div>
-      {tasksWithDates.length === 0 ? (
-        <div className="empty"><p>Keine Aufgaben mit Startdatum</p></div>
+      {allBars.length === 0 ? (
+        <div className="empty"><p>Keine Aufgaben oder Termine mit Datum</p></div>
       ) : (
         <div style={{ overflowX: "auto", border: "1px solid var(--border)", borderRadius: "var(--r-sm)", background: "var(--s0)" }}>
           <div style={{ minWidth: 110 + days.length * dayWidth }}>
             <div style={{ display: "flex", borderBottom: "1px solid var(--border2)", height: 36, background: "var(--s1)" }}>
-              <div className="gantt-label display" style={{ fontSize: 11, color: "var(--muted)", display: "flex", alignItems: "center" }}>Aufgabe</div>
+              <div className="gantt-label display" style={{ fontSize: 11, color: "var(--muted)", display: "flex", alignItems: "center" }}>Eintrag</div>
               <div style={{ flex: 1, display: "flex" }}>
                 {days.map(d => {
                   const dt = new Date(d + "T12:00:00");
@@ -1960,25 +2285,25 @@ function GanttView({ state, openTask }) {
                 })}
               </div>
             </div>
-            {tasksWithDates.map(t => {
-              const startIdx = days.indexOf(t.startDate);
-              const endIdx = days.indexOf(t.endDate || t.startDate);
+            {allBars.map(b => {
+              const startIdx = days.indexOf(b.startDate);
+              const endIdx = days.indexOf(b.endDate);
               const visStart = startIdx === -1 ? 0 : startIdx;
               const visEnd = endIdx === -1 ? days.length - 1 : endIdx;
               if (visEnd < 0 || visStart >= days.length) {
-                const tStart = new Date(t.startDate + "T12:00:00");
-                const tEnd = new Date((t.endDate || t.startDate) + "T12:00:00");
+                const tStart = new Date(b.startDate + "T12:00:00");
+                const tEnd = new Date(b.endDate + "T12:00:00");
                 if (tEnd < headerStart || tStart > headerEnd) return null;
               }
               const left = Math.max(0, visStart) * dayWidth;
               const width = (Math.min(visEnd, days.length - 1) - Math.max(0, visStart) + 1) * dayWidth - 2;
               if (width <= 0) return null;
               return (
-                <div key={t.id} className="gantt-row" onClick={() => openTask(t.id)} style={{ cursor: "pointer" }}>
-                  <div className="gantt-label">{t.title}</div>
+                <div key={`${b.kind}-${b.id}`} className="gantt-row" onClick={() => b.kind === "task" ? openTask(b.id) : openEvent(b.id)} style={{ cursor: "pointer" }}>
+                  <div className="gantt-label">{b.title}</div>
                   <div className="gantt-track">
-                    <div className="gantt-bar" style={{ left, width, background: catOf(t.category).color, opacity: t.status === "done" ? 0.4 : 1 }}>
-                      {width > 60 && t.title}
+                    <div className="gantt-bar" style={{ left, width, background: b.color, opacity: b.faded ? 0.4 : 1 }}>
+                      {width > 60 && b.title}
                     </div>
                     {days.includes(today) && <div className="gantt-today-line" style={{ left: days.indexOf(today) * dayWidth + dayWidth / 2 }} />}
                   </div>
@@ -2081,7 +2406,32 @@ function ShoppingView({ state, dispatch }) {
       {adding && (
         <div className="card" style={{ marginBottom: 12 }}>
           <div className="row" style={{ gap: 8 }}>
-            <input className="input" placeholder="Listen-Name..." value={newName} onChange={e => setNewName(e.target.value)} onKeyDown={e => { if (e.key === "Enter" && newName.trim()) { const id = uid(); dispatch({ type: "ADD_LIST", payload: { id, name: newName.trim(), color: COLORS[state.shoppingLists.length % COLORS.length], items: [] } }); setActive(id); setNewName(""); setAdding(false); } }} autoFocus />
+            <input
+              className="input"
+              placeholder="Listen-Name..."
+              value={newName}
+              onChange={e => setNewName(e.target.value)}
+              onKeyDown={e => {
+                if (e.key === "Enter" && newName.trim()) {
+                  const id = uid();
+                  dispatch({ type: "ADD_LIST", payload: { id, name: newName.trim(), color: COLORS[state.shoppingLists.length % COLORS.length], items: [] } });
+                  setActive(id); setNewName(""); setAdding(false);
+                }
+              }}
+              autoFocus
+            />
+            <button
+              className="btn btn-primary"
+              disabled={!newName.trim()}
+              onClick={() => {
+                if (!newName.trim()) return;
+                const id = uid();
+                dispatch({ type: "ADD_LIST", payload: { id, name: newName.trim(), color: COLORS[state.shoppingLists.length % COLORS.length], items: [] } });
+                setActive(id); setNewName(""); setAdding(false);
+              }}
+              style={{ padding: "10px 14px" }}
+            >OK</button>
+            <button className="btn btn-ghost" onClick={() => { setNewName(""); setAdding(false); }}>Abbrechen</button>
           </div>
         </div>
       )}
@@ -2133,7 +2483,7 @@ function MoreView({ state, dispatch, setSubView }) {
     { id: "stats", icon: "📊", label: "Statistik", count: null, color: "#00E0FF" },
     { id: "books", icon: "📚", label: "Bücher", count: state.books.length, color: "#10EDAA" },
     { id: "meals", icon: "🍳", label: "Mahlzeiten", count: null, color: "#FFB800" },
-    { id: "budget", icon: "💰", label: "Budget", count: state.budget.length, color: "#FF2D78" },
+    { id: "notes", icon: "📝", label: "Notizen", count: (state.notes || []).length, color: "#FF2D78" },
   ];
   return (
     <div className="view">
@@ -2451,6 +2801,124 @@ function BudgetSub({ state, dispatch, onBack }) {
   );
 }
 
+function NotesSub({ state, dispatch, onBack }) {
+  const [editing, setEditing] = useState(null); // null | "new" | id
+  const [draft, setDraft] = useState({ title: "", content: "", color: "#FFB800", tags: [], pinned: false });
+  const [newTag, setNewTag] = useState("");
+  const NOTE_COLORS = [
+    { id: "#FFB800", name: "Gelb" },
+    { id: "#AAFF00", name: "Lime" },
+    { id: "#00E0FF", name: "Cyan" },
+    { id: "#FF2D78", name: "Pink" },
+    { id: "#8B5CF6", name: "Lila" },
+    { id: "#FF6B35", name: "Orange" },
+  ];
+  const notes = state.notes || [];
+  // Sort: pinned first, then most recent
+  const sorted = [...notes].sort((a, b) => {
+    if (a.pinned && !b.pinned) return -1;
+    if (!a.pinned && b.pinned) return 1;
+    return (b.updatedAt || b.createdAt || 0) - (a.updatedAt || a.createdAt || 0);
+  });
+  const startEdit = (n) => {
+    setDraft({ title: n.title || "", content: n.content || "", color: n.color || "#FFB800", tags: n.tags || [], pinned: !!n.pinned });
+    setEditing(n.id);
+  };
+  const startNew = () => {
+    setDraft({ title: "", content: "", color: "#FFB800", tags: [], pinned: false });
+    setEditing("new");
+  };
+  const save = () => {
+    if (!draft.title.trim() && !draft.content.trim()) { setEditing(null); return; }
+    if (editing === "new") {
+      dispatch({ type: "ADD_NOTE", payload: { id: uid(), ...draft, title: draft.title.trim(), content: draft.content, createdAt: Date.now(), updatedAt: Date.now() } });
+    } else {
+      dispatch({ type: "UPD_NOTE", payload: { id: editing, ...draft, title: draft.title.trim() } });
+    }
+    setEditing(null);
+  };
+  const addTag = () => {
+    const t = newTag.trim();
+    if (!t || draft.tags.includes(t)) return;
+    setDraft({ ...draft, tags: [...draft.tags, t] });
+    setNewTag("");
+  };
+  const removeTag = (t) => setDraft({ ...draft, tags: draft.tags.filter(x => x !== t) });
+  return (
+    <div className="view">
+      <div className="row" style={{ marginBottom: 14 }}>
+        <button onClick={onBack} className="btn btn-ghost btn-icon"><ChevronLeft size={18} /></button>
+        <h2 className="display" style={{ fontSize: 22, flex: 1 }}>📝 Notizen</h2>
+        {!editing && <button className="btn btn-primary" onClick={startNew} style={{ padding: "7px 11px", fontSize: 11 }}><Plus size={13} /> NEU</button>}
+      </div>
+      {editing && (
+        <div className="card" style={{ marginBottom: 14, borderLeft: `4px solid ${draft.color}` }}>
+          <input className="input" placeholder="Titel..." value={draft.title} onChange={e => setDraft({ ...draft, title: e.target.value })} style={{ marginBottom: 10 }} autoFocus />
+          <textarea className="textarea" placeholder="Schreib was..." value={draft.content} onChange={e => setDraft({ ...draft, content: e.target.value })} style={{ minHeight: 140, marginBottom: 10 }} />
+          <div className="stat-label" style={{ marginBottom: 6 }}>Farbe</div>
+          <div className="row" style={{ gap: 6, marginBottom: 12, flexWrap: "wrap" }}>
+            {NOTE_COLORS.map(c => (
+              <button key={c.id} onClick={() => setDraft({ ...draft, color: c.id })} style={{
+                width: 30, height: 30, borderRadius: "50%", background: c.id, cursor: "pointer",
+                border: draft.color === c.id ? "3px solid #fff" : "2px solid var(--border)",
+              }} title={c.name} />
+            ))}
+          </div>
+          <div className="stat-label" style={{ marginBottom: 6 }}>Tags</div>
+          <div className="row" style={{ flexWrap: "wrap", gap: 5, marginBottom: 8 }}>
+            {draft.tags.map(t => (
+              <span key={t} className="tag" style={{ background: draft.color + "22", color: draft.color, fontSize: 11, cursor: "pointer" }} onClick={() => removeTag(t)}>
+                {t} <X size={10} style={{ marginLeft: 3, verticalAlign: "middle" }} />
+              </span>
+            ))}
+          </div>
+          <div className="row" style={{ gap: 6, marginBottom: 12 }}>
+            <input className="input" placeholder="Tag..." value={newTag} onChange={e => setNewTag(e.target.value)} onKeyDown={e => { if (e.key === "Enter") { e.preventDefault(); addTag(); } }} style={{ flex: 1 }} />
+            <button className="btn btn-ghost" onClick={addTag} style={{ padding: "8px 12px" }}>Add</button>
+          </div>
+          <div className="card-sm" onClick={() => setDraft({ ...draft, pinned: !draft.pinned })} style={{ cursor: "pointer", borderColor: draft.pinned ? "var(--lime)" : "var(--border)", marginBottom: 10 }}>
+            <div className="between">
+              <span style={{ fontSize: 13 }}>📌 Anpinnen</span>
+              <span className={`chk ${draft.pinned ? "on" : ""}`}>{draft.pinned && <Check size={12} color="#000" strokeWidth={3} />}</span>
+            </div>
+          </div>
+          <div className="row" style={{ gap: 8 }}>
+            <button className="btn btn-ghost" onClick={() => setEditing(null)} style={{ flex: 1 }}>Abbrechen</button>
+            {editing !== "new" && (
+              <button className="btn btn-danger" onClick={() => { if (confirm("Notiz löschen?")) { dispatch({ type: "DEL_NOTE", payload: editing }); setEditing(null); } }} style={{ flex: 1 }}>Löschen</button>
+            )}
+            <button className="btn btn-primary" onClick={save} style={{ flex: 2 }}>Speichern</button>
+          </div>
+        </div>
+      )}
+      {!editing && (
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+          {sorted.map(n => (
+            <div key={n.id} onClick={() => startEdit(n)} style={{
+              background: n.color + "22", border: `1.5px solid ${n.color}55`, borderRadius: "var(--r)",
+              padding: 12, cursor: "pointer", minHeight: 120, display: "flex", flexDirection: "column",
+              position: "relative",
+            }}>
+              {n.pinned && <span style={{ position: "absolute", top: 6, right: 8, fontSize: 12 }}>📌</span>}
+              <div className="display" style={{ fontSize: 14, color: n.color, marginBottom: 6, paddingRight: n.pinned ? 16 : 0 }}>{n.title || "Ohne Titel"}</div>
+              <div style={{ fontSize: 11, color: "var(--text)", opacity: 0.85, flex: 1, overflow: "hidden", display: "-webkit-box", WebkitLineClamp: 5, WebkitBoxOrient: "vertical", whiteSpace: "pre-wrap" }}>{n.content}</div>
+              {n.tags && n.tags.length > 0 && (
+                <div className="row" style={{ flexWrap: "wrap", gap: 3, marginTop: 6 }}>
+                  {n.tags.slice(0, 3).map(t => <span key={t} style={{ fontSize: 9, color: n.color, opacity: 0.85 }}>#{t}</span>)}
+                  {n.tags.length > 3 && <span style={{ fontSize: 9, color: "var(--muted)" }}>+{n.tags.length - 3}</span>}
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+      {!editing && sorted.length === 0 && (
+        <div className="empty"><span style={{ fontSize: 32 }}>📝</span><p>Noch keine Notizen. Tipp auf NEU.</p></div>
+      )}
+    </div>
+  );
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // MAIN APP
 // ════════════════════════════════════════════════════════════════════════════
@@ -2520,7 +2988,7 @@ export default function App() {
     }
   }, [loaded]);
 
-  useNotifications(state.tasks, state.events, state.workouts, state.settings);
+  useNotifications(state.tasks, state.events, state.workouts, state.habits, state.settings);
 
   const taskDetail = openTaskId ? state.tasks.find(t => t.id === openTaskId) : null;
   const eventDetail = openEventId ? state.events.find(e => e.id === openEventId) : null;
@@ -2575,6 +3043,7 @@ export default function App() {
               {moreSubView === "books" && <BooksSub state={state} dispatch={dispatch} onBack={() => setMoreSubView(null)} />}
               {moreSubView === "meals" && <MealsSub state={state} dispatch={dispatch} onBack={() => setMoreSubView(null)} />}
               {moreSubView === "budget" && <BudgetSub state={state} dispatch={dispatch} onBack={() => setMoreSubView(null)} />}
+              {moreSubView === "notes" && <NotesSub state={state} dispatch={dispatch} onBack={() => setMoreSubView(null)} />}
             </>
           )}
         </div>
