@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useReducer, useRef, useMemo, useCallback } from "react";
+import { createPortal } from "react-dom";
 import {
   Home, CheckSquare, Calendar, Target, MoreHorizontal, Plus, X, Trash2, Check,
   ChevronLeft, ChevronRight, Clock, Search, Mic, Settings, Bell, Zap,
@@ -5544,9 +5545,10 @@ function BirthdayDetailModal({ bday, state, dispatch, onClose, personName, nextB
     updateBday({ giftReminderWeeks: weeks });
   };
 
-  return (
-    <div className="overlay center" onClick={e => e.target === e.currentTarget && onClose()}>
-      <div className="modal center">
+  return createPortal(
+    <div className="overlay" onClick={e => e.target === e.currentTarget && onClose()}>
+      <div className="modal">
+        <div className="grip" />
         <div className="between" style={{ marginBottom: 12 }}>
           <span className="tag" style={{ background: "rgba(255,45,120,0.18)", color: "#FF2D78" }}>🎂 Geburtstag</span>
           <button className="btn btn-ghost btn-icon" onClick={onClose}><X size={18} /></button>
@@ -5612,7 +5614,8 @@ function BirthdayDetailModal({ bday, state, dispatch, onClose, personName, nextB
           </div>
         </div>
       </div>
-    </div>
+    </div>,
+    document.body
   );
 }
 
