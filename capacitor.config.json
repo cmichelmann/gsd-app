@@ -3,6 +3,7 @@
   "appName": "GET SHIT DONE",
   "webDir": "dist",
   "server": {
+    "url": "https://cmichelmann.github.io/gsd-app/",
     "androidScheme": "https"
   },
   "android": {

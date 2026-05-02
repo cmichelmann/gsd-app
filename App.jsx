@@ -2350,6 +2350,7 @@ function QuickAddModal({ onClose, onPick }) {
                 cursor: "pointer", padding: 18, textAlign: "center",
                 display: "flex", flexDirection: "column", alignItems: "center", gap: 6,
                 border: "1px solid var(--border)", background: "rgba(28,28,28,0.7)",
+                color: "var(--text)",
               }}
             >
               <span style={{ fontSize: 30 }}>{it.emoji}</span>
