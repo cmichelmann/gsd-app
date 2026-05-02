@@ -3508,7 +3508,7 @@ function MonthView({ state, dispatch, openTask, openEvent, openAddEvent }) {
           {cells.map((c, i) => {
             const ds = cellDate(c);
             const items = itemsByDate[ds] || [];
-            const hasHoliday = items.some(it => it.kind === "event" && it.item.isHoliday);
+            const hasHoliday = items.some(it => it.kind === "event" && it.item.isHoliday && it.item.holidayKind === "legal");
             const isToday = ds === today;
             return (
               <div
