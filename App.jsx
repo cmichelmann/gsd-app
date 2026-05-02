@@ -1241,7 +1241,7 @@ function reducer(state, { type, payload }) {
     }
     case "ADD_EVENT":   return touch({ ...state, events: [...state.events, payload] });
     case "UPD_EVENT":   return touch({ ...state, events: state.events.map(e => e.id === payload.id ? { ...e, ...payload } : e) });
-    case "DEL_EVENT":   return touch({ ...state, events: state.events.filter(e => e.id !== payload) });
+    case "DEL_EVENT":   return touch({ ...state, events: state.events.filter(e => e.id !== payload), tasks: state.tasks.filter(t => t.giftEventId !== payload) });
     case "ADD_WORKOUT": return touch({ ...state, workouts: [...state.workouts, payload] });
     case "UPD_WORKOUT": return touch({ ...state, workouts: state.workouts.map(w => w.id === payload.id ? { ...w, ...payload } : w) });
     case "DEL_WORKOUT": return touch({ ...state, workouts: state.workouts.filter(w => w.id !== payload) });
@@ -1725,17 +1725,20 @@ function AddEventModal({ onClose, onAdd, defaultDate, defaultType }) {
   const [notes, setNotes] = useState("");
   const [reminderMinutes, setReminderMinutes] = useState(60);
   const [yearly, setYearly] = useState(false);
+  const [birthYear, setBirthYear] = useState("");
 
   const submit = () => {
     if (!title.trim()) return;
     const t = eventTypeOf(type);
+    const isBday = type === "birthday";
     onAdd({
       id: uid(), title: title.trim(), type,
       startDate, endDate: endDate || startDate,
       allDay, startTime: allDay ? "" : startTime, endTime: allDay ? "" : endTime,
       notes: notes.trim(), color: t.color, reminderMinutes: Number(reminderMinutes),
-      recurrence: (yearly || type === "birthday") ? { type: "yearly" } : null,
+      recurrence: (yearly || isBday) ? { type: "yearly" } : null,
       isHoliday: false, createdAt: Date.now(),
+      ...(isBday ? { birthYear: birthYear ? Number(birthYear) : null, gifts: [], giftReminderWeeks: null } : {}),
     });
     onClose();
   };
@@ -1788,6 +1791,11 @@ function AddEventModal({ onClose, onAdd, defaultDate, defaultType }) {
                 <span style={{ fontSize: 13 }}>🔁 Jährlich wiederholen</span>
                 <span className={`chk ${yearly ? "on" : ""}`}>{yearly && <Check size={12} color="#000" strokeWidth={3} />}</span>
               </div>
+            </div>
+          )}
+          {type === "birthday" && (
+            <div><label className="label">🎂 Geburtsjahr (optional)</label>
+              <input className="input" type="number" placeholder="z.B. 1990" value={birthYear} onChange={e => setBirthYear(e.target.value)} min="1900" max={new Date().getFullYear()} />
             </div>
           )}
           <button className="btn btn-primary" onClick={submit} style={{ width: "100%", padding: 14, fontSize: 15 }}>⚡ TERMIN ERSTELLEN</button>
@@ -2112,12 +2120,17 @@ function EventDetailModal({ event, onClose, dispatch }) {
               </select>
             </div>
             {(draft.type === "birthday") && (
-              <div className="card-sm" onClick={() => setDraft({ ...draft, recurrence: draft.recurrence?.type === "yearly" ? null : { type: "yearly" } })} style={{ cursor: "pointer" }}>
-                <div className="between">
-                  <span style={{ fontSize: 13 }}>🔁 Jährlich wiederholen</span>
-                  <span className={`chk ${draft.recurrence?.type === "yearly" ? "on" : ""}`}>{draft.recurrence?.type === "yearly" && <Check size={12} color="#000" strokeWidth={3} />}</span>
+              <>
+                <div className="card-sm" onClick={() => setDraft({ ...draft, recurrence: draft.recurrence?.type === "yearly" ? null : { type: "yearly" } })} style={{ cursor: "pointer" }}>
+                  <div className="between">
+                    <span style={{ fontSize: 13 }}>🔁 Jährlich wiederholen</span>
+                    <span className={`chk ${draft.recurrence?.type === "yearly" ? "on" : ""}`}>{draft.recurrence?.type === "yearly" && <Check size={12} color="#000" strokeWidth={3} />}</span>
+                  </div>
                 </div>
-              </div>
+                <div><label className="label">🎂 Geburtsjahr (optional)</label>
+                  <input className="input" type="number" placeholder="z.B. 1990" value={draft.birthYear ?? ""} onChange={e => setDraft({ ...draft, birthYear: e.target.value === "" ? null : Number(e.target.value) })} min="1900" max={new Date().getFullYear()} />
+                </div>
+              </>
             )}
             <div className="row" style={{ gap: 8, marginTop: 4 }}>
               <button className="btn btn-ghost" onClick={() => { setDraft(event); setEditing(false); }} style={{ flex: 1 }}>Abbrechen</button>
@@ -4271,6 +4284,7 @@ function ShoppingView({ state, dispatch }) {
 }
 
 function MoreView({ state, dispatch, setSubView }) {
+  const birthdayCount = (state.events || []).filter(e => e.type === "birthday" && !e.isHoliday).length;
   const tiles = [
     { id: "habits", icon: "🔥", label: "Habits", count: state.habits.length, color: "#FF6B35" },
     { id: "subs", icon: "💳", label: "Abos", count: (state.subscriptions || []).length, color: "#AAFF00" },
@@ -4278,6 +4292,7 @@ function MoreView({ state, dispatch, setSubView }) {
     { id: "books", icon: "📚", label: "Bücher", count: state.books.length, color: "#10EDAA" },
     { id: "meals", icon: "🍳", label: "Mahlzeiten", count: null, color: "#FFB800" },
     { id: "notes", icon: "📝", label: "Notizen", count: (state.notes || []).length, color: "#FF2D78" },
+    { id: "birthdays", icon: "🎂", label: "Geburtstage", count: birthdayCount, color: "#FF2D78" },
     ...(state.settings.featureGratitude ? [{ id: "gratitude", icon: "🙏", label: "Dankbarkeit", count: (state.gratitude || []).length, color: "#FFB800" }] : []),
     ...(state.settings.featureAchievements ? [{ id: "achievements", icon: "🏆", label: "Achievements", count: `${(state.achievements || []).length}/${ACHIEVEMENTS.length}`, color: "#AAFF00" }] : []),
     ...(state.settings.featureHeatmap ? [{ id: "heatmap", icon: "🔥", label: "Heatmap", count: null, color: "#FF2D78" }] : []),
@@ -5385,6 +5400,223 @@ function BudgetSub({ state, dispatch, onBack }) {
   );
 }
 
+function BirthdaysSub({ state, dispatch, onBack }) {
+  const [openId, setOpenId] = useState(null);
+  const today = localDate();
+
+  const nextBdayDate = (e) => {
+    if (!e.startDate) return null;
+    const [, mm, dd] = e.startDate.split("-");
+    const yr = new Date().getFullYear();
+    const thisYear = `${yr}-${mm}-${dd}`;
+    return thisYear >= today ? thisYear : `${yr + 1}-${mm}-${dd}`;
+  };
+  const daysUntil = (dateStr) => {
+    if (!dateStr) return null;
+    const d1 = new Date(today + "T00:00:00");
+    const d2 = new Date(dateStr + "T00:00:00");
+    return Math.round((d2 - d1) / 86400000);
+  };
+  const ageAtNext = (e) => {
+    if (!e.birthYear) return null;
+    const next = nextBdayDate(e);
+    if (!next) return null;
+    return Number(next.split("-")[0]) - Number(e.birthYear);
+  };
+  const personName = (title) => (title || "").replace(/[\s']+Geburtstag\s*$/i, "").trim() || title;
+
+  const birthdays = useMemo(() => (state.events || [])
+    .filter(e => e.type === "birthday" && !e.isHoliday)
+    .map(e => ({ ...e, _next: nextBdayDate(e), _days: daysUntil(nextBdayDate(e)), _age: ageAtNext(e) }))
+    .sort((a, b) => (a._days ?? 9999) - (b._days ?? 9999)),
+  [state.events, today]);
+
+  // Reminder-task sync on mount: ensure each bday with giftReminderWeeks set has one active linked task with the right date.
+  useEffect(() => {
+    birthdays.forEach(b => {
+      if (!b.giftReminderWeeks || !b._next) return;
+      const dueDate = localDate(addDays(new Date(b._next + "T12:00:00"), -b.giftReminderWeeks * 7));
+      const active = state.tasks.find(t => t.giftEventId === b.id && t.status !== "done");
+      if (!active) {
+        dispatch({ type: "ADD_TASK", payload: {
+          id: uid(), title: `🎁 Geschenk für ${personName(b.title)}`, notes: "",
+          status: "todo", priority: 2, category: "birthday",
+          startDate: dueDate, endDate: dueDate, startTime: "", endTime: "", allDay: true,
+          subtasks: [], tags: [], projectId: null,
+          estimatedMinutes: 0, actualMinutes: 0, energy: "any", isFrog: false,
+          reminderMinutes: 0, recurrence: null, createdAt: Date.now(),
+          giftEventId: b.id,
+        } });
+      } else if (active.startDate !== dueDate) {
+        dispatch({ type: "UPD_TASK", payload: { id: active.id, startDate: dueDate, endDate: dueDate } });
+      }
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const open = openId ? birthdays.find(b => b.id === openId) : null;
+
+  return (
+    <div className="view">
+      <div className="row" style={{ marginBottom: 14 }}>
+        <button onClick={onBack} className="btn btn-ghost btn-icon"><ChevronLeft size={18} /></button>
+        <h2 className="display" style={{ fontSize: 22, flex: 1 }}>🎂 Geburtstage</h2>
+      </div>
+      <p style={{ fontSize: 12, color: "var(--muted)", marginBottom: 12 }}>
+        Geburtstage legst du über den ⚡ FAB-Button → Geburtstag an. Hier verwaltest du Geschenkideen und Erinnerungs-Tasks.
+      </p>
+      <div className="col" style={{ gap: 8 }}>
+        {birthdays.map(b => {
+          const giftCount = (b.gifts || []).length;
+          const boughtCount = (b.gifts || []).filter(g => g.bought).length;
+          return (
+            <div key={b.id} className="card" onClick={() => setOpenId(b.id)} style={{ cursor: "pointer" }}>
+              <div className="between">
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div className="row" style={{ gap: 6, marginBottom: 4 }}>
+                    <span style={{ fontSize: 18 }}>🎂</span>
+                    <span style={{ fontSize: 15, fontWeight: 600 }}>{personName(b.title)}</span>
+                  </div>
+                  <div className="mono" style={{ fontSize: 11, color: "var(--muted)" }}>
+                    {new Date(b._next + "T12:00:00").toLocaleDateString("de-DE", { weekday: "short", day: "numeric", month: "long" })}
+                    {b._age != null && ` · wird ${b._age}`}
+                  </div>
+                </div>
+                <div style={{ textAlign: "right" }}>
+                  <div className="display" style={{ fontSize: 18, color: b._days === 0 ? "var(--lime)" : "var(--pink)" }}>
+                    {b._days === 0 ? "HEUTE" : `${b._days}`}
+                  </div>
+                  {b._days !== 0 && <div className="mono" style={{ fontSize: 9, color: "var(--muted)", letterSpacing: "0.05em" }}>TAGE</div>}
+                </div>
+              </div>
+              {giftCount > 0 && (
+                <div className="mono" style={{ fontSize: 10, color: "var(--muted)", marginTop: 8, paddingTop: 8, borderTop: "1px solid var(--border)" }}>
+                  🎁 {boughtCount}/{giftCount} {giftCount === 1 ? "Geschenk" : "Geschenke"}{b.giftReminderWeeks ? ` · 🔔 ${b.giftReminderWeeks} Wo. vorher` : ""}
+                </div>
+              )}
+            </div>
+          );
+        })}
+        {birthdays.length === 0 && <div className="empty"><p>Noch keine Geburtstage.<br/>Tippe und halte den ⚡ FAB-Button.</p></div>}
+      </div>
+      {open && <BirthdayDetailModal bday={open} state={state} dispatch={dispatch} onClose={() => setOpenId(null)} personName={personName} nextBdayDate={nextBdayDate} />}
+    </div>
+  );
+}
+
+function BirthdayDetailModal({ bday, state, dispatch, onClose, personName, nextBdayDate }) {
+  const [giftDraft, setGiftDraft] = useState({ title: "", link: "" });
+  const gifts = bday.gifts || [];
+
+  const updateBday = (patch) => dispatch({ type: "UPD_EVENT", payload: { id: bday.id, ...patch } });
+
+  const addGift = () => {
+    if (!giftDraft.title.trim()) return;
+    updateBday({ gifts: [...gifts, { id: uid(), title: giftDraft.title.trim(), link: giftDraft.link.trim() || null, bought: false }] });
+    setGiftDraft({ title: "", link: "" });
+  };
+  const toggleBought = (gid) => updateBday({ gifts: gifts.map(g => g.id === gid ? { ...g, bought: !g.bought } : g) });
+  const delGift = (gid) => updateBday({ gifts: gifts.filter(g => g.id !== gid) });
+
+  const setReminder = (weeks) => {
+    const active = state.tasks.find(t => t.giftEventId === bday.id && t.status !== "done");
+    if (weeks === null) {
+      // off — delete linked active task if any
+      if (active) dispatch({ type: "DEL_TASK", payload: active.id });
+      updateBday({ giftReminderWeeks: null });
+      return;
+    }
+    const next = nextBdayDate(bday);
+    const dueDate = next ? localDate(addDays(new Date(next + "T12:00:00"), -weeks * 7)) : null;
+    if (active && dueDate) {
+      dispatch({ type: "UPD_TASK", payload: { id: active.id, startDate: dueDate, endDate: dueDate } });
+    } else if (!active && dueDate) {
+      dispatch({ type: "ADD_TASK", payload: {
+        id: uid(), title: `🎁 Geschenk für ${personName(bday.title)}`, notes: "",
+        status: "todo", priority: 2, category: "birthday",
+        startDate: dueDate, endDate: dueDate, startTime: "", endTime: "", allDay: true,
+        subtasks: [], tags: [], projectId: null,
+        estimatedMinutes: 0, actualMinutes: 0, energy: "any", isFrog: false,
+        reminderMinutes: 0, recurrence: null, createdAt: Date.now(),
+        giftEventId: bday.id,
+      } });
+    }
+    updateBday({ giftReminderWeeks: weeks });
+  };
+
+  return (
+    <div className="overlay" onClick={e => e.target === e.currentTarget && onClose()}>
+      <div className="modal">
+        <div className="grip" />
+        <div className="between" style={{ marginBottom: 12 }}>
+          <span className="tag" style={{ background: "rgba(255,45,120,0.18)", color: "#FF2D78" }}>🎂 Geburtstag</span>
+          <button className="btn btn-ghost btn-icon" onClick={onClose}><X size={18} /></button>
+        </div>
+        <h3 style={{ fontSize: 22, fontWeight: 700, marginBottom: 6 }}>{personName(bday.title)}</h3>
+        <p className="mono" style={{ fontSize: 13, color: "var(--muted)", marginBottom: 4 }}>
+          {new Date(bday._next + "T12:00:00").toLocaleDateString("de-DE", { weekday: "long", day: "numeric", month: "long" })}
+          {bday._age != null && ` · wird ${bday._age}`}
+        </p>
+        <p className="display" style={{ fontSize: 16, color: "#FF2D78", marginBottom: 18 }}>
+          {bday._days === 0 ? "🎉 HEUTE!" : `in ${bday._days} ${bday._days === 1 ? "Tag" : "Tagen"}`}
+        </p>
+
+        {!bday.birthYear && (
+          <div className="card-sm" style={{ marginBottom: 14, background: "rgba(255,184,0,0.08)", borderColor: "rgba(255,184,0,0.3)" }}>
+            <p style={{ fontSize: 12, color: "var(--muted)" }}>
+              💡 Geburtsjahr nicht eingetragen — öffne den Termin im Kalender und klicke ✏️, um es zu ergänzen. Dann zeigt die App das Alter automatisch.
+            </p>
+          </div>
+        )}
+
+        <div style={{ marginBottom: 18 }}>
+          <div className="label" style={{ marginBottom: 8 }}>🎁 Geschenkideen</div>
+          {gifts.length === 0 && <p style={{ fontSize: 12, color: "var(--muted)", marginBottom: 8 }}>Noch keine Ideen — füg unten welche hinzu.</p>}
+          <div className="col" style={{ gap: 6, marginBottom: 10 }}>
+            {gifts.map(g => (
+              <div key={g.id} className="card-sm" style={{ background: g.bought ? "rgba(170,255,0,0.08)" : "var(--s2)" }}>
+                <div className="between">
+                  <div className="row" style={{ gap: 8, flex: 1, minWidth: 0 }}>
+                    <span className={`chk ${g.bought ? "on" : ""}`} onClick={() => toggleBought(g.id)} style={{ cursor: "pointer", flexShrink: 0 }}>
+                      {g.bought && <Check size={12} color="#000" strokeWidth={3} />}
+                    </span>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontSize: 13, textDecoration: g.bought ? "line-through" : "none", color: g.bought ? "var(--muted)" : "var(--text)" }}>{g.title}</div>
+                      {g.link && <a href={g.link} target="_blank" rel="noopener noreferrer" onClick={e => e.stopPropagation()} style={{ fontSize: 10, color: "var(--lime)", textDecoration: "underline", wordBreak: "break-all" }}>🔗 {g.link}</a>}
+                    </div>
+                  </div>
+                  <button className="btn btn-ghost btn-icon" onClick={() => delGift(g.id)} style={{ width: 26, height: 26 }}><X size={11} /></button>
+                </div>
+              </div>
+            ))}
+          </div>
+          <input className="input" placeholder="Geschenkidee..." value={giftDraft.title} onChange={e => setGiftDraft({ ...giftDraft, title: e.target.value })} style={{ marginBottom: 6 }} />
+          <input className="input" placeholder="Link (optional)" value={giftDraft.link} onChange={e => setGiftDraft({ ...giftDraft, link: e.target.value })} style={{ marginBottom: 6 }} />
+          <button className="btn btn-primary" onClick={addGift} style={{ width: "100%" }}><Plus size={13} /> Hinzufügen</button>
+        </div>
+
+        <div>
+          <div className="label" style={{ marginBottom: 8 }}>🔔 Erinnerungs-Task im Backlog</div>
+          <p style={{ fontSize: 11, color: "var(--muted)", marginBottom: 8 }}>
+            Erstellt automatisch eine Aufgabe "🎁 Geschenk für {personName(bday.title)}" zum gewählten Zeitpunkt vor dem Geburtstag.
+          </p>
+          <div className="row" style={{ gap: 6 }}>
+            {[
+              { v: null, l: "Aus" },
+              { v: 1, l: "1 Woche vorher" },
+              { v: 2, l: "2 Wochen vorher" },
+            ].map(opt => (
+              <button key={String(opt.v)} className={`chip ${bday.giftReminderWeeks === opt.v ? "on" : ""}`} onClick={() => setReminder(opt.v)} style={{ flex: 1, justifyContent: "center" }}>
+                {opt.l}
+              </button>
+            ))}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function NotesSub({ state, dispatch, onBack }) {
   const [editing, setEditing] = useState(null); // null | "new" | id
   const [draft, setDraft] = useState({ title: "", content: "", color: "#FFB800", tags: [], pinned: false });
@@ -5791,6 +6023,7 @@ function AppInner() {
               {moreSubView === "meals" && <MealsSub state={state} dispatch={dispatch} onBack={() => setMoreSubView(null)} />}
               {moreSubView === "budget" && <BudgetSub state={state} dispatch={dispatch} onBack={() => setMoreSubView(null)} />}
               {moreSubView === "notes" && <NotesSub state={state} dispatch={dispatch} onBack={() => setMoreSubView(null)} />}
+              {moreSubView === "birthdays" && <BirthdaysSub state={state} dispatch={dispatch} onBack={() => setMoreSubView(null)} />}
             </>
           )}
         </div>
