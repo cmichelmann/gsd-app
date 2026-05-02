@@ -5,7 +5,7 @@ import {
   ChevronLeft, ChevronRight, Clock, Search, Mic, Settings, Bell, Zap,
   Coffee, Play, Pause, RotateCcw, ShoppingCart, BookOpen, Wallet, ChefHat,
   Download, Upload, Plane, Repeat, GripVertical, BarChart2, Sparkles, Edit3,
-  MicOff, Dumbbell, Cake
+  MicOff, Dumbbell, Cake, Star
 } from "lucide-react";
 import {
   AreaChart, Area, BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer,
@@ -5401,6 +5401,56 @@ function BudgetSub({ state, dispatch, onBack }) {
   );
 }
 
+function renderBirthdayCard(b, { setOpenId, dispatch, personName }) {
+  const giftCount = (b.gifts || []).length;
+  const boughtCount = (b.gifts || []).filter(g => g.bought).length;
+  const toggleFavorite = (e) => {
+    e.stopPropagation();
+    dispatch({ type: "UPD_EVENT", payload: { id: b.id, favorite: !b.favorite } });
+  };
+  return (
+    <div key={b.id} className="card" onClick={() => setOpenId(b.id)} style={{ cursor: "pointer" }}>
+      <div className="between">
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div className="row" style={{ gap: 6, marginBottom: 4 }}>
+            <span style={{ fontSize: 18 }}>🎂</span>
+            <span style={{ fontSize: 15, fontWeight: 600 }}>{personName(b.title)}</span>
+          </div>
+          <div className="mono" style={{ fontSize: 11, color: "var(--muted)" }}>
+            {new Date(b._next + "T12:00:00").toLocaleDateString("de-DE", { weekday: "short", day: "numeric", month: "long" })}
+            {b._age != null && ` · wird ${b._age}`}
+          </div>
+        </div>
+        <div className="row" style={{ gap: 10, alignItems: "center" }}>
+          <button
+            onClick={toggleFavorite}
+            aria-label={b.favorite ? "Favorit entfernen" : "Als Favorit markieren"}
+            style={{ background: "none", border: "none", padding: 4, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}
+          >
+            <Star
+              size={20}
+              color={b.favorite ? "var(--lime)" : "var(--muted)"}
+              fill={b.favorite ? "var(--lime)" : "none"}
+              strokeWidth={2}
+            />
+          </button>
+          <div style={{ textAlign: "right" }}>
+            <div className="display" style={{ fontSize: 18, color: b._days === 0 ? "var(--lime)" : "var(--pink)" }}>
+              {b._days === 0 ? "HEUTE" : `${b._days}`}
+            </div>
+            {b._days !== 0 && <div className="mono" style={{ fontSize: 9, color: "var(--muted)", letterSpacing: "0.05em" }}>TAGE</div>}
+          </div>
+        </div>
+      </div>
+      {giftCount > 0 && (
+        <div className="mono" style={{ fontSize: 10, color: "var(--muted)", marginTop: 8, paddingTop: 8, borderTop: "1px solid var(--border)" }}>
+          🎁 {boughtCount}/{giftCount} {giftCount === 1 ? "Geschenk" : "Geschenke"}{b.giftReminderWeeks ? ` · 🔔 ${b.giftReminderWeeks} Wo. vorher` : ""}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function BirthdaysSub({ state, dispatch, onBack }) {
   const [openId, setOpenId] = useState(null);
   const today = localDate();
@@ -5426,11 +5476,17 @@ function BirthdaysSub({ state, dispatch, onBack }) {
   };
   const personName = (title) => (title || "").replace(/[\s']+Geburtstag\s*$/i, "").trim() || title;
 
-  const birthdays = useMemo(() => (state.events || [])
-    .filter(e => e.type === "birthday" && !e.isHoliday)
-    .map(e => ({ ...e, _next: nextBdayDate(e), _days: daysUntil(nextBdayDate(e)), _age: ageAtNext(e) }))
-    .sort((a, b) => (a._days ?? 9999) - (b._days ?? 9999)),
-  [state.events, today]);
+  const { favorites, rest } = useMemo(() => {
+    const all = (state.events || [])
+      .filter(e => e.type === "birthday" && !e.isHoliday)
+      .map(e => ({ ...e, _next: nextBdayDate(e), _days: daysUntil(nextBdayDate(e)), _age: ageAtNext(e) }))
+      .sort((a, b) => (a._days ?? 9999) - (b._days ?? 9999));
+    return {
+      favorites: all.filter(b => b.favorite),
+      rest: all.filter(b => !b.favorite),
+    };
+  }, [state.events, today]);
+  const birthdays = useMemo(() => [...favorites, ...rest], [favorites, rest]);
 
   // Reminder-task sync on mount: ensure each bday with giftReminderWeeks set has one active linked task with the right date.
   useEffect(() => {
@@ -5467,37 +5523,16 @@ function BirthdaysSub({ state, dispatch, onBack }) {
         Geburtstage legst du über den ⚡ FAB-Button → Geburtstag an. Hier verwaltest du Geschenkideen und Erinnerungs-Tasks.
       </p>
       <div className="col" style={{ gap: 8 }}>
-        {birthdays.map(b => {
-          const giftCount = (b.gifts || []).length;
-          const boughtCount = (b.gifts || []).filter(g => g.bought).length;
-          return (
-            <div key={b.id} className="card" onClick={() => setOpenId(b.id)} style={{ cursor: "pointer" }}>
-              <div className="between">
-                <div style={{ flex: 1, minWidth: 0 }}>
-                  <div className="row" style={{ gap: 6, marginBottom: 4 }}>
-                    <span style={{ fontSize: 18 }}>🎂</span>
-                    <span style={{ fontSize: 15, fontWeight: 600 }}>{personName(b.title)}</span>
-                  </div>
-                  <div className="mono" style={{ fontSize: 11, color: "var(--muted)" }}>
-                    {new Date(b._next + "T12:00:00").toLocaleDateString("de-DE", { weekday: "short", day: "numeric", month: "long" })}
-                    {b._age != null && ` · wird ${b._age}`}
-                  </div>
-                </div>
-                <div style={{ textAlign: "right" }}>
-                  <div className="display" style={{ fontSize: 18, color: b._days === 0 ? "var(--lime)" : "var(--pink)" }}>
-                    {b._days === 0 ? "HEUTE" : `${b._days}`}
-                  </div>
-                  {b._days !== 0 && <div className="mono" style={{ fontSize: 9, color: "var(--muted)", letterSpacing: "0.05em" }}>TAGE</div>}
-                </div>
-              </div>
-              {giftCount > 0 && (
-                <div className="mono" style={{ fontSize: 10, color: "var(--muted)", marginTop: 8, paddingTop: 8, borderTop: "1px solid var(--border)" }}>
-                  🎁 {boughtCount}/{giftCount} {giftCount === 1 ? "Geschenk" : "Geschenke"}{b.giftReminderWeeks ? ` · 🔔 ${b.giftReminderWeeks} Wo. vorher` : ""}
-                </div>
-              )}
-            </div>
-          );
-        })}
+        {favorites.length > 0 && (
+          <div className="mono" style={{ fontSize: 10, color: "var(--lime)", letterSpacing: "0.08em", textTransform: "uppercase", marginBottom: -2 }}>
+            ⭐ Favoriten
+          </div>
+        )}
+        {favorites.map(b => renderBirthdayCard(b, { setOpenId, dispatch, personName }))}
+        {favorites.length > 0 && rest.length > 0 && (
+          <div style={{ height: 1, background: "var(--border)", margin: "6px 0" }} />
+        )}
+        {rest.map(b => renderBirthdayCard(b, { setOpenId, dispatch, personName }))}
         {birthdays.length === 0 && <div className="empty"><p>Noch keine Geburtstage.<br/>Tippe und halte den ⚡ FAB-Button.</p></div>}
       </div>
       {open && <BirthdayDetailModal bday={open} state={state} dispatch={dispatch} onClose={() => setOpenId(null)} personName={personName} nextBdayDate={nextBdayDate} />}
