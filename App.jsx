@@ -5545,9 +5545,8 @@ function BirthdayDetailModal({ bday, state, dispatch, onClose, personName, nextB
   };
 
   return (
-    <div className="overlay" onClick={e => e.target === e.currentTarget && onClose()}>
-      <div className="modal">
-        <div className="grip" />
+    <div className="overlay center" onClick={e => e.target === e.currentTarget && onClose()}>
+      <div className="modal center">
         <div className="between" style={{ marginBottom: 12 }}>
           <span className="tag" style={{ background: "rgba(255,45,120,0.18)", color: "#FF2D78" }}>🎂 Geburtstag</span>
           <button className="btn btn-ghost btn-icon" onClick={onClose}><X size={18} /></button>
