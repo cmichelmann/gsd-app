@@ -2757,12 +2757,27 @@ function SettingsModal({ state, dispatch, onClose }) {
     else alert("Notifications wurden vom Browser/System nicht erlaubt.");
   };
   const disableNotifications = () => dispatch({ type: "UPD_SETTINGS", payload: { notifications: false } });
-  const exportData = () => {
-    const blob = new Blob([JSON.stringify(state, null, 2)], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url; a.download = `gsd-backup-${localDate()}.json`; a.click();
-    URL.revokeObjectURL(url);
+  const exportData = async () => {
+    try {
+      const json = JSON.stringify(state, null, 2);
+      const filename = `gsd-backup-${localDate()}.json`;
+      const file = new File([json], filename, { type: "application/json" });
+
+      if (navigator.canShare?.({ files: [file] })) {
+        await navigator.share({ files: [file], title: "GSD Backup" });
+        return;
+      }
+
+      const blob = new Blob([json], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url; a.download = filename;
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (e) {
+      if (e?.name === "AbortError") return;
+      alert("Export fehlgeschlagen: " + (e?.message || "Unbekannter Fehler"));
+    }
   };
   const importData = (file) => {
     const reader = new FileReader();
