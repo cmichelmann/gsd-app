@@ -2758,25 +2758,40 @@ function SettingsModal({ state, dispatch, onClose }) {
   };
   const disableNotifications = () => dispatch({ type: "UPD_SETTINGS", payload: { notifications: false } });
   const exportData = async () => {
-    try {
-      const json = JSON.stringify(state, null, 2);
-      const filename = `gsd-backup-${localDate()}.json`;
-      const file = new File([json], filename, { type: "application/json" });
+    const json = JSON.stringify(state, null, 2);
+    const filename = `gsd-backup-${localDate()}.json`;
+    const sizeKB = (json.length / 1024).toFixed(1);
 
-      if (navigator.canShare?.({ files: [file] })) {
+    if (navigator.share) {
+      try {
+        const file = new File([json], filename, { type: "application/json" });
         await navigator.share({ files: [file], title: "GSD Backup" });
         return;
+      } catch (e) {
+        if (e?.name === "AbortError") return;
       }
+    }
 
+    let downloadAttempted = false;
+    try {
       const blob = new Blob([json], { type: "application/json" });
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url; a.download = filename;
       document.body.appendChild(a); a.click(); a.remove();
       setTimeout(() => URL.revokeObjectURL(url), 1000);
+      downloadAttempted = true;
+    } catch (e) {}
+
+    try {
+      await navigator.clipboard.writeText(json);
+      alert(
+        downloadAttempted
+          ? `Falls kein Download-Dialog kam: das Backup (${sizeKB} KB) liegt jetzt in der Zwischenablage. Füge es in einer Notiz, E-Mail oder Telegram an dich selbst ein, um es extern zu sichern.`
+          : `Backup wurde in die Zwischenablage kopiert (${sizeKB} KB). Füge es in einer Notiz, E-Mail oder Telegram an dich selbst ein, um es extern zu sichern.`
+      );
     } catch (e) {
-      if (e?.name === "AbortError") return;
-      alert("Export fehlgeschlagen: " + (e?.message || "Unbekannter Fehler"));
+      alert("Export fehlgeschlagen: " + (e?.message || "Browser blockiert Datei-Share, Download und Zwischenablage."));
     }
   };
   const importData = (file) => {
