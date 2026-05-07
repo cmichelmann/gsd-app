@@ -232,7 +232,7 @@ html, body, #root { height: 100%; background: #000; color: var(--text); overflow
 // ════════════════════════════════════════════════════════════════════════════
 // SCHEMA & MIGRATIONS
 // ════════════════════════════════════════════════════════════════════════════
-const SCHEMA_VERSION = 9;
+const SCHEMA_VERSION = 10;
 const STORAGE_KEY = "gsd-data";
 
 // localStorage wrapper that mimics Claude's window.storage API
@@ -273,6 +273,12 @@ function getDefaults() {
       notifications: false, userName: "", userBirthday: "", dailyRitualDate: null, onboarded: false, lastRolloverDate: null,
       notifTasks: true, notifEvents: true, notifBirthdays: true, notifWorkouts: true, notifHabits: false,
       dailyDigest: false, dailyDigestTime: "07:00",
+      // Notification defaults — used by add-modals when user doesn't override per-item
+      defaultTaskReminder: 30, defaultEventReminder: 30, defaultBirthdayReminder: 1440, defaultWorkoutReminder: 30,
+      // Quiet hours — push-time shift window
+      quietHoursEnabled: true, quietHoursStart: "22:00", quietHoursEnd: "07:00",
+      // Morning nudge — one consolidated notification for habits + untimed tasks + day-of birthdays
+      morningNudgeEnabled: true, morningNudgeTime: "09:00",
       calendarFilters: { tasks: true, events: true, vacation: true, birthdays: true, holidays: true, habits: true, sport: true },
       searchHistory: [],
       featureGratitude: true, featureAchievements: true, featureHeatmap: true,
@@ -356,6 +362,15 @@ const migrations = {
   9: (d) => ({
     ...d, version: 9,
     workouts: (d.workouts || []).map(w => ({ ...w, completions: w.completions || {} })),
+  }),
+  10: (d) => ({
+    ...d, version: 10,
+    settings: {
+      defaultTaskReminder: 30, defaultEventReminder: 30, defaultBirthdayReminder: 1440, defaultWorkoutReminder: 30,
+      quietHoursEnabled: true, quietHoursStart: "22:00", quietHoursEnd: "07:00",
+      morningNudgeEnabled: true, morningNudgeTime: "09:00",
+      ...(d.settings || {}),
+    },
   }),
 };
 
@@ -954,11 +969,56 @@ function checkAchievements(state) {
 // ════════════════════════════════════════════════════════════════════════════
 // NOTIFICATIONS — Capacitor LocalNotifications when on Android, web fallback otherwise
 // ════════════════════════════════════════════════════════════════════════════
+function shiftIntoWakingHours(at, quietHours) {
+  if (!quietHours?.enabled) return at;
+  const start = quietHours.start || "22:00";
+  const end = quietHours.end || "07:00";
+  const [sH, sM] = start.split(":").map(Number);
+  const [eH, eM] = end.split(":").map(Number);
+  const d = new Date(at);
+  const minutes = d.getHours() * 60 + d.getMinutes();
+  const startMin = sH * 60 + sM;
+  const endMin = eH * 60 + eM;
+  const inQuiet = startMin > endMin
+    ? (minutes >= startMin || minutes < endMin) // wraps midnight
+    : (minutes >= startMin && minutes < endMin);
+  if (!inQuiet) return at;
+  // Shift to end of quiet period (= start of waking hours) on the appropriate day
+  const shifted = new Date(d);
+  shifted.setHours(eH, eM, 0, 0);
+  if (startMin > endMin && minutes >= startMin) {
+    // We're past midnight cut — quiet ends today; if today's end-time is before now, shift to tomorrow morning
+    if (shifted.getTime() <= d.getTime()) shifted.setDate(shifted.getDate() + 1);
+  }
+  return shifted;
+}
+
 const Notif = {
   isCapacitor: () => typeof window !== "undefined" && !!window.Capacitor?.isNativePlatform?.(),
+  _actionsRegistered: false,
   toIntId(id) {
     if (typeof id === "number") return Math.abs(id) % 2147483647;
     return Math.abs(hashCode(String(id))) % 2147483647;
+  },
+  async ensureActionTypesRegistered() {
+    if (!this.isCapacitor() || this._actionsRegistered) return;
+    try {
+      await LocalNotifications.registerActionTypes({
+        types: [
+          { id: "task", actions: [
+            { id: "done", title: "Erledigt ✓" },
+            { id: "snooze15", title: "+15 Min" },
+          ] },
+          { id: "habit", actions: [
+            { id: "done", title: "Erledigt ✓" },
+          ] },
+          { id: "birthday", actions: [
+            { id: "wish", title: "Glückwunsch" },
+          ] },
+        ],
+      });
+      this._actionsRegistered = true;
+    } catch (e) { console.warn("registerActionTypes failed", e); }
   },
   async requestPermission() {
     if (this.isCapacitor()) {
@@ -973,25 +1033,30 @@ const Notif = {
     const r = await Notification.requestPermission();
     return r === "granted";
   },
-  async schedule({ id, title, body, at, channelKey }) {
+  async schedule({ id, title, body, largeBody, at, channelKey, actionTypeId, extra, quietHours }) {
     if (!at) return;
-    const delay = new Date(at).getTime() - Date.now();
+    const shiftedAt = shiftIntoWakingHours(new Date(at), quietHours);
+    const delay = shiftedAt.getTime() - Date.now();
     if (delay < 0) return;
     if (this.isCapacitor()) {
       try {
-        await LocalNotifications.schedule({ notifications: [{
+        await this.ensureActionTypesRegistered();
+        const notification = {
           id: this.toIntId(id), title, body,
-          schedule: { at: new Date(at), allowWhileIdle: true },
-          extra: { channelKey },
+          schedule: { at: shiftedAt, allowWhileIdle: true },
+          extra: { channelKey, ...(extra || {}) },
           smallIcon: "ic_stat_icon_config_sample",
-        }] });
+        };
+        if (largeBody) notification.largeBody = largeBody;
+        if (actionTypeId) notification.actionTypeId = actionTypeId;
+        await LocalNotifications.schedule({ notifications: [notification] });
       } catch (e) { console.warn("LocalNotifications.schedule failed", e); }
       return;
     }
     if (typeof Notification === "undefined" || Notification.permission !== "granted") return;
     if (delay > 2147483647) return;
     setTimeout(() => {
-      try { new Notification(title, { body, tag: String(id), icon: `${import.meta.env.BASE_URL}icon-192.png` }); } catch {}
+      try { new Notification(title, { body: largeBody || body, tag: String(id), icon: `${import.meta.env.BASE_URL}icon-192.png` }); } catch {}
     }, delay);
   },
   async cancelAllPending() {
@@ -1004,27 +1069,12 @@ const Notif = {
       } catch (e) { console.warn("LocalNotifications.cancelAll failed", e); }
     }
   },
-  async scheduleDailyDigest({ time, getStateForDate }) {
-    if (!time) return;
-    const [hh, mm] = time.split(":").map(Number);
-    const now = new Date();
-    for (let i = 0; i < 7; i++) {
-      const d = new Date(now); d.setDate(now.getDate() + i);
-      d.setHours(hh, mm, 0, 0);
-      if (d.getTime() < Date.now()) continue;
-      const dateStr = localDate(d);
-      const { title, body } = getStateForDate(dateStr);
-      this.schedule({
-        id: `digest-${dateStr}`,
-        title, body, at: d, channelKey: "digest",
-      });
-    }
-  },
-  async fireNow({ title, body }) {
+  async fireNow({ title, body, largeBody }) {
     if (this.isCapacitor()) {
       try {
         await LocalNotifications.schedule({ notifications: [{
           id: Date.now() % 2147483647, title, body,
+          ...(largeBody ? { largeBody } : {}),
           schedule: { at: new Date(Date.now() + 1000) },
         }] });
       } catch (e) { console.warn("LocalNotifications.fireNow failed", e); }
@@ -1034,45 +1084,94 @@ const Notif = {
       alert("Notifications nicht erlaubt. Erst aktivieren.");
       return;
     }
-    try { new Notification(title, { body, icon: `${import.meta.env.BASE_URL}icon-192.png` }); } catch {}
+    try { new Notification(title, { body: largeBody || body, icon: `${import.meta.env.BASE_URL}icon-192.png` }); } catch {}
   },
 };
 function hashCode(s) { let h = 0; for (let i = 0; i < s.length; i++) { h = ((h << 5) - h) + s.charCodeAt(i); h |= 0; } return h; }
 
-// Build complete day list as text — used for digest notification body
+// Build complete day list — used for digest notification body and largeBody
 function buildDigestBody(state, dateStr) {
   const dt = new Date(dateStr + "T12:00:00");
   const weekday = (dt.getDay() + 6) % 7;
   const tasks = state.tasks.filter(t => getTaskDates(t, dateStr, dateStr).includes(dateStr) && t.status !== "done");
-  const events = state.events.filter(e => getEventDates(e, dateStr, dateStr).includes(dateStr));
+  const events = state.events.filter(e => getEventDates(e, dateStr, dateStr).includes(dateStr) && !e.isHoliday);
+  const holidays = state.events.filter(e => getEventDates(e, dateStr, dateStr).includes(dateStr) && e.isHoliday && e.holidayKind === "legal");
   const workouts = state.workouts.filter(w => w.weekday === weekday);
   const habits = (state.habits || []).filter(h => {
     if (h.frequency !== "daily") return false;
     if (!h.weekdays || h.weekdays.length === 0) return true;
     return h.weekdays.includes(weekday);
   });
-  const items = [
-    ...events.map(e => ({ time: e.startTime || "", icon: e.isHoliday ? "🎉" : e.type === "birthday" ? "🎂" : e.type === "vacation" ? "✈️" : "📅", title: e.title })),
-    ...tasks.map(t => ({ time: t.startTime || "", icon: t.isFrog ? "💩" : "⚡", title: t.title })),
-    ...workouts.map(w => ({ time: w.time || "", icon: "💪", title: w.title })),
-    ...habits.map(h => ({ time: "", icon: h.emoji || "🔥", title: h.title })),
-  ].sort((a, b) => {
-    if (!a.time && b.time) return -1;
-    if (a.time && !b.time) return 1;
-    return (a.time || "").localeCompare(b.time || "");
-  });
   const dayLabel = dt.toLocaleDateString("de-DE", { weekday: "long", day: "numeric", month: "long" });
-  const counts = `${events.length} Termine · ${tasks.length} Aufgaben · ${workouts.length} Sport · ${habits.length} Habits`;
-  if (items.length === 0) {
+  const totalCount = events.length + tasks.length + workouts.length + habits.length;
+  const fmtTime = (t) => t ? `${t}  ` : "";
+
+  if (totalCount === 0 && holidays.length === 0) {
     return {
-      title: `💩 Dein Tag — ${dayLabel}`,
+      title: `💩 ${dayLabel}`,
       body: "Heute steht nichts an. Nice. Mach was draus.",
+      largeBody: undefined,
     };
   }
-  const lines = items.map(it => `${it.time ? it.time + "  " : ""}${it.icon} ${it.title}`).join("\n");
+  const sortByTime = (arr) => arr.slice().sort((a, b) => (a.time || "").localeCompare(b.time || ""));
+  const sections = [];
+  if (holidays.length) sections.push({ heading: "▸ Feiertag", lines: holidays.map(h => `   🎉 ${h.title}`) });
+  const taskRows = sortByTime(tasks.map(t => ({ time: t.startTime || "", line: `   ${fmtTime(t.startTime || "")}${t.isFrog ? "💩" : "⚡"} ${t.title}${t.notes ? " · " + t.notes.slice(0, 40) : ""}` })));
+  if (taskRows.length) sections.push({ heading: `▸ Aufgaben (${taskRows.length})`, lines: taskRows.map(r => r.line) });
+  const eventRows = sortByTime(events.map(e => ({ time: e.startTime || "", line: `   ${fmtTime(e.startTime || "")}${e.type === "birthday" ? "🎂" : e.type === "vacation" ? "✈️" : "📅"} ${e.title}${e.notes ? " · " + e.notes.slice(0, 40) : ""}` })));
+  if (eventRows.length) sections.push({ heading: `▸ Termine (${eventRows.length})`, lines: eventRows.map(r => r.line) });
+  const workoutRows = sortByTime(workouts.map(w => ({ time: w.time || "", line: `   ${fmtTime(w.time || "")}💪 ${w.title}` })));
+  if (workoutRows.length) sections.push({ heading: `▸ Sport (${workoutRows.length})`, lines: workoutRows.map(r => r.line) });
+  if (habits.length) sections.push({ heading: `▸ Habits (${habits.length})`, lines: habits.map(h => `   ${h.emoji || "🔥"} ${h.title}`) });
+
+  const largeBody = sections.map(s => `${s.heading}\n${s.lines.join("\n")}`).join("\n\n");
+  const summary = [
+    events.length && `${events.length} Termine`,
+    tasks.length && `${tasks.length} Aufgaben`,
+    workouts.length && `${workouts.length} Sport`,
+    habits.length && `${habits.length} Habits`,
+  ].filter(Boolean).join(" · ");
   return {
-    title: `💩 Dein Tag — ${dayLabel}`,
-    body: `${counts}\n\n${lines}`,
+    title: `💩 ${dayLabel}`,
+    body: summary,
+    largeBody,
+  };
+}
+
+// Build morning-nudge content: habits + untimed tasks due today + day-of birthdays
+function buildMorningNudge(state, dateStr) {
+  const dt = new Date(dateStr + "T12:00:00");
+  const weekday = (dt.getDay() + 6) % 7;
+  const habits = (state.habits || []).filter(h => {
+    if (h.frequency !== "daily") return false;
+    if (!h.weekdays || h.weekdays.length === 0) return true;
+    return h.weekdays.includes(weekday);
+  });
+  const untimedTasks = state.tasks.filter(t => {
+    if (t.status === "done") return false;
+    if (t.startTime) return false;
+    return getTaskDates(t, dateStr, dateStr).includes(dateStr);
+  });
+  const todayBirthdays = state.events.filter(e =>
+    e.type === "birthday" && !e.isHoliday && getEventDates(e, dateStr, dateStr).includes(dateStr)
+  );
+  const total = habits.length + untimedTasks.length + todayBirthdays.length;
+  if (total === 0) return null;
+
+  const sections = [];
+  if (todayBirthdays.length) sections.push(todayBirthdays.map(b => `🎂 ${b.title}${b.birthYear ? ` (wird ${dt.getFullYear() - b.birthYear})` : ""}`).join("\n"));
+  if (untimedTasks.length) sections.push(untimedTasks.map(t => `${t.isFrog ? "💩" : "⚡"} ${t.title}`).join("\n"));
+  if (habits.length) sections.push(habits.map(h => `${h.emoji || "🔥"} ${h.title}`).join("\n"));
+  const largeBody = sections.join("\n\n");
+  const summary = [
+    todayBirthdays.length && `${todayBirthdays.length} Geburtstag${todayBirthdays.length === 1 ? "" : "e"}`,
+    untimedTasks.length && `${untimedTasks.length} Aufgabe${untimedTasks.length === 1 ? "" : "n"}`,
+    habits.length && `${habits.length} Habit${habits.length === 1 ? "" : "s"}`,
+  ].filter(Boolean).join(" · ");
+  return {
+    title: `☀️ Heute ${summary}`,
+    body: summary,
+    largeBody,
   };
 }
 
@@ -1371,31 +1470,45 @@ function useNotifications(state) {
   const { tasks, events, workouts, habits, settings } = state;
   useEffect(() => {
     if (!settings.notifications) {
-      // Notifications disabled — clear anything we previously scheduled
       Notif.cancelAllPending();
       return;
     }
     let cancelled = false;
+    const quietHours = {
+      enabled: !!settings.quietHoursEnabled,
+      start: settings.quietHoursStart || "22:00",
+      end: settings.quietHoursEnd || "07:00",
+    };
+    const schedule = (opts) => {
+      if (cancelled) return;
+      Notif.schedule({ ...opts, quietHours });
+    };
     (async () => {
-      // Reset every time data changes — guarantees deleted items don't keep firing
       await Notif.cancelAllPending();
       if (cancelled) return;
       const seen = new Set();
-      const schedule = (key, fireAt, channelKey, title, body) => {
+      const safeSchedule = (key, fireAt, opts) => {
         if (seen.has(key)) return;
         if (fireAt <= Date.now()) return;
         seen.add(key);
-        Notif.schedule({ id: key, title, body, at: new Date(fireAt), channelKey });
+        schedule({ id: key, at: new Date(fireAt), ...opts });
       };
-      // Tasks
+      // Tasks (only those with startTime — untimed land in morning nudge)
       if (settings.notifTasks) {
         tasks.forEach(t => {
           if (!t.startDate || !t.startTime || !t.reminderMinutes || t.status === "done") return;
           const dueMs = new Date(`${t.startDate}T${t.startTime}:00`).getTime();
-          schedule(`task-${t.id}-${dueMs}`, dueMs - t.reminderMinutes * 60000, "tasks", `⚡ ${t.title}`, `Beginnt um ${t.startTime} Uhr`);
+          const subInfo = (t.subtasks || []).length ? ` · ${(t.subtasks || []).filter(s => !s.done).length}/${(t.subtasks || []).length} Subtasks offen` : "";
+          safeSchedule(`task-${t.id}-${dueMs}`, dueMs - t.reminderMinutes * 60000, {
+            channelKey: "tasks",
+            title: `⚡ ${t.title}`,
+            body: `Beginnt um ${t.startTime} Uhr${subInfo}`,
+            actionTypeId: "task",
+            extra: { taskId: t.id, kind: "task" },
+          });
         });
       }
-      // Events / Birthdays
+      // Events / Birthdays / Vacation
       (events || []).forEach(e => {
         if (!e.startDate || !e.reminderMinutes || e.isHoliday) return;
         const isBday = e.type === "birthday";
@@ -1404,7 +1517,18 @@ function useNotifications(state) {
         const time = e.startTime || "09:00";
         const dueMs = new Date(`${e.startDate}T${time}:00`).getTime();
         const icon = isBday ? "🎂" : e.type === "vacation" ? "✈️" : "📅";
-        schedule(`event-${e.id}-${dueMs}`, dueMs - e.reminderMinutes * 60000, isBday ? "birthdays" : "events", `${icon} ${e.title}`, e.notes || "Erinnerung");
+        let body = e.notes || "Erinnerung";
+        if (isBday && e.birthYear) {
+          const age = new Date(e.startDate + "T12:00:00").getFullYear() - e.birthYear;
+          body = `Wird ${age}${e.notes ? " · " + e.notes : ""}`;
+        }
+        safeSchedule(`event-${e.id}-${dueMs}`, dueMs - e.reminderMinutes * 60000, {
+          channelKey: isBday ? "birthdays" : "events",
+          title: `${icon} ${e.title}`,
+          body,
+          actionTypeId: isBday ? "birthday" : undefined,
+          extra: { eventId: e.id, kind: isBday ? "birthday" : "event" },
+        });
       });
       // Workouts (next 7 days)
       if (settings.notifWorkouts) {
@@ -1416,33 +1540,56 @@ function useNotifications(state) {
             if (((d.getDay() + 6) % 7) === w.weekday) {
               const dateStr = localDate(d);
               const dueMs = new Date(`${dateStr}T${w.time}:00`).getTime();
-              schedule(`workout-${w.id}-${dateStr}`, dueMs - w.reminderMinutes * 60000, "workouts", `💪 ${w.title}`, `${workoutTypeOf(w.type).label} um ${w.time}`);
+              safeSchedule(`workout-${w.id}-${dateStr}`, dueMs - w.reminderMinutes * 60000, {
+                channelKey: "workouts",
+                title: `💪 ${w.title}`,
+                body: `${workoutTypeOf(w.type).label} um ${w.time}${w.notes ? " · " + w.notes : ""}`,
+                extra: { workoutId: w.id, kind: "workout" },
+              });
             }
           }
         });
       }
-      // Habits — daily 08:00 reminder for next 7 days
-      if (settings.notifHabits) {
-        const today = new Date();
-        (habits || []).forEach(h => {
-          for (let i = 0; i < 7; i++) {
-            const d = addDays(today, i);
-            const dateStr = localDate(d);
-            const dueMs = new Date(`${dateStr}T08:00:00`).getTime();
-            schedule(`habit-${h.id}-${dateStr}`, dueMs, "habits", `${h.emoji || "🔥"} ${h.title}`, "Habit-Erinnerung");
-          }
-        });
+      // Morning nudge — one consolidated notification per day for next 7 days
+      if (settings.morningNudgeEnabled && settings.morningNudgeTime) {
+        const [hh, mm] = settings.morningNudgeTime.split(":").map(Number);
+        const now = new Date();
+        for (let i = 0; i < 7; i++) {
+          const d = new Date(now); d.setDate(now.getDate() + i);
+          d.setHours(hh, mm, 0, 0);
+          if (d.getTime() < Date.now()) continue;
+          const dateStr = localDate(d);
+          const nudge = buildMorningNudge(state, dateStr);
+          if (!nudge) continue;
+          safeSchedule(`nudge-${dateStr}`, d.getTime(), {
+            channelKey: "nudge",
+            title: nudge.title,
+            body: nudge.body,
+            largeBody: nudge.largeBody,
+            extra: { kind: "nudge", date: dateStr },
+          });
+        }
       }
-      // Daily digest — full day plan at chosen time
+      // Daily digest — full day plan at chosen time, next 7 days
       if (settings.dailyDigest && settings.dailyDigestTime) {
-        Notif.scheduleDailyDigest({
-          time: settings.dailyDigestTime,
-          getStateForDate: (dateStr) => buildDigestBody(state, dateStr),
-        });
+        const [hh, mm] = settings.dailyDigestTime.split(":").map(Number);
+        const now = new Date();
+        for (let i = 0; i < 7; i++) {
+          const d = new Date(now); d.setDate(now.getDate() + i);
+          d.setHours(hh, mm, 0, 0);
+          if (d.getTime() < Date.now()) continue;
+          const dateStr = localDate(d);
+          const { title, body, largeBody } = buildDigestBody(state, dateStr);
+          safeSchedule(`digest-${dateStr}`, d.getTime(), {
+            channelKey: "digest",
+            title, body, largeBody,
+            extra: { kind: "digest", date: dateStr },
+          });
+        }
       }
     })();
     return () => { cancelled = true; };
-  }, [tasks, events, workouts, habits, settings.notifications, settings.notifTasks, settings.notifEvents, settings.notifBirthdays, settings.notifWorkouts, settings.notifHabits, settings.dailyDigest, settings.dailyDigestTime]);
+  }, [tasks, events, workouts, habits, settings.notifications, settings.notifTasks, settings.notifEvents, settings.notifBirthdays, settings.notifWorkouts, settings.notifHabits, settings.dailyDigest, settings.dailyDigestTime, settings.morningNudgeEnabled, settings.morningNudgeTime, settings.quietHoursEnabled, settings.quietHoursStart, settings.quietHoursEnd]);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1591,7 +1738,7 @@ function SplashScreen({ onStart }) {
       </div>
       <div style={{ textAlign: "center", width: "100%", maxWidth: 360 }}>
         <div className="splash-logo">GET SHIT <span className="lime">DONE!</span></div>
-        <div style={{ marginTop: 14, color: "var(--lime)", fontFamily: "JetBrains Mono", fontSize: 11, letterSpacing: "0.3em", opacity: 0.8 }}>⚡ V3.0 ⚡</div>
+        <div style={{ marginTop: 14, color: "var(--lime)", fontFamily: "JetBrains Mono", fontSize: 11, letterSpacing: "0.3em", opacity: 0.8 }}>⚡ v{__APP_VERSION__} ⚡</div>
         <p className="splash-tag" style={{ marginTop: 18, marginBottom: 22 }}>
           Mach jetzt endlich dein Scheiß fertig, Junge!
         </p>
@@ -1606,7 +1753,7 @@ function SplashScreen({ onStart }) {
 // ════════════════════════════════════════════════════════════════════════════
 // MODALS
 // ════════════════════════════════════════════════════════════════════════════
-function AddTaskModal({ onClose, onAdd, projects }) {
+function AddTaskModal({ onClose, onAdd, projects, settings }) {
   const [title, setTitle] = useState("");
   const [notes, setNotes] = useState("");
   const [cat, setCat] = useState("privat");
@@ -1618,7 +1765,7 @@ function AddTaskModal({ onClose, onAdd, projects }) {
   const [startTime, setStartTime] = useState("");
   const [endTime, setEndTime] = useState("");
   const [energy, setEnergy] = useState("any");
-  const [reminderMinutes, setReminderMinutes] = useState(0);
+  const [reminderMinutes, setReminderMinutes] = useState(settings?.defaultTaskReminder ?? 30);
   const [projectId, setProjectId] = useState("");
   const [isFrog, setIsFrog] = useState(false);
   const [recType, setRecType] = useState("none");
@@ -1738,7 +1885,7 @@ function AddTaskModal({ onClose, onAdd, projects }) {
   );
 }
 
-function AddEventModal({ onClose, onAdd, defaultDate, defaultType }) {
+function AddEventModal({ onClose, onAdd, defaultDate, defaultType, settings }) {
   const [title, setTitle] = useState("");
   const [type, setType] = useState(defaultType || "event");
   const [allDay, setAllDay] = useState(true);
@@ -1747,7 +1894,8 @@ function AddEventModal({ onClose, onAdd, defaultDate, defaultType }) {
   const [startTime, setStartTime] = useState("");
   const [endTime, setEndTime] = useState("");
   const [notes, setNotes] = useState("");
-  const [reminderMinutes, setReminderMinutes] = useState(60);
+  const reminderDefault = (defaultType === "birthday" ? settings?.defaultBirthdayReminder : settings?.defaultEventReminder) ?? (defaultType === "birthday" ? 1440 : 30);
+  const [reminderMinutes, setReminderMinutes] = useState(reminderDefault);
   const [yearly, setYearly] = useState(false);
   const [birthYear, setBirthYear] = useState("");
 
@@ -1829,14 +1977,14 @@ function AddEventModal({ onClose, onAdd, defaultDate, defaultType }) {
   );
 }
 
-function AddWorkoutModal({ onClose, onAdd, onUpdate, onDelete, defaultWeekday, editing }) {
+function AddWorkoutModal({ onClose, onAdd, onUpdate, onDelete, defaultWeekday, editing, settings }) {
   const [title, setTitle] = useState(editing?.title || "");
   const [type, setType] = useState(editing?.type || "strength");
   const [weekday, setWeekday] = useState(editing?.weekday ?? defaultWeekday ?? 1);
   const [time, setTime] = useState(editing?.time || "07:00");
   const [duration, setDuration] = useState(editing?.duration ?? 60);
   const [notes, setNotes] = useState(editing?.notes || "");
-  const [reminderMinutes, setReminderMinutes] = useState(editing?.reminderMinutes ?? 30);
+  const [reminderMinutes, setReminderMinutes] = useState(editing?.reminderMinutes ?? settings?.defaultWorkoutReminder ?? 30);
   const isEdit = !!editing;
   const submit = () => {
     if (!title.trim()) return;
@@ -3004,6 +3152,105 @@ function SettingsModal({ state, dispatch, onClose }) {
             </div>
           )}
 
+          {/* Morning Nudge */}
+          {state.settings.notifications && (
+            <div className="card-sm">
+              <div className="between" onClick={() => dispatch({ type: "UPD_SETTINGS", payload: { morningNudgeEnabled: !state.settings.morningNudgeEnabled } })} style={{ cursor: "pointer" }}>
+                <div>
+                  <div style={{ fontWeight: 600, fontSize: 14 }}>☀️ Morning Nudge</div>
+                  <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 2 }}>
+                    {state.settings.morningNudgeEnabled ? `Eine Notification um ${state.settings.morningNudgeTime || "09:00"} mit Habits, untimed Tasks und heutigen Geburtstagen` : "Aus"}
+                  </div>
+                </div>
+                <span className={`chk ${state.settings.morningNudgeEnabled ? "on" : ""}`}>{state.settings.morningNudgeEnabled && <Check size={12} color="#000" strokeWidth={3} />}</span>
+              </div>
+              {state.settings.morningNudgeEnabled && (
+                <>
+                  <div style={{ borderTop: "1px solid var(--border)", margin: "10px 0 8px", opacity: 0.5 }} />
+                  <div className="row" style={{ gap: 8, alignItems: "center" }}>
+                    <span style={{ fontSize: 13, flex: 1 }}>⏰ Uhrzeit</span>
+                    <input
+                      type="time"
+                      className="input"
+                      value={state.settings.morningNudgeTime || "09:00"}
+                      onChange={e => dispatch({ type: "UPD_SETTINGS", payload: { morningNudgeTime: e.target.value } })}
+                      style={{ width: 110, padding: "6px 10px", fontSize: 13 }}
+                    />
+                  </div>
+                </>
+              )}
+            </div>
+          )}
+
+          {/* Quiet Hours */}
+          {state.settings.notifications && (
+            <div className="card-sm">
+              <div className="between" onClick={() => dispatch({ type: "UPD_SETTINGS", payload: { quietHoursEnabled: !state.settings.quietHoursEnabled } })} style={{ cursor: "pointer" }}>
+                <div>
+                  <div style={{ fontWeight: 600, fontSize: 14 }}>🌙 Ruhezeiten</div>
+                  <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 2 }}>
+                    {state.settings.quietHoursEnabled ? `Keine Notifications zwischen ${state.settings.quietHoursStart || "22:00"} – ${state.settings.quietHoursEnd || "07:00"}` : "Aus"}
+                  </div>
+                </div>
+                <span className={`chk ${state.settings.quietHoursEnabled ? "on" : ""}`}>{state.settings.quietHoursEnabled && <Check size={12} color="#000" strokeWidth={3} />}</span>
+              </div>
+              {state.settings.quietHoursEnabled && (
+                <>
+                  <div style={{ borderTop: "1px solid var(--border)", margin: "10px 0 8px", opacity: 0.5 }} />
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+                    <div>
+                      <div className="label">Von</div>
+                      <input type="time" className="input" value={state.settings.quietHoursStart || "22:00"} onChange={e => dispatch({ type: "UPD_SETTINGS", payload: { quietHoursStart: e.target.value } })} style={{ padding: "6px 10px", fontSize: 13 }} />
+                    </div>
+                    <div>
+                      <div className="label">Bis</div>
+                      <input type="time" className="input" value={state.settings.quietHoursEnd || "07:00"} onChange={e => dispatch({ type: "UPD_SETTINGS", payload: { quietHoursEnd: e.target.value } })} style={{ padding: "6px 10px", fontSize: 13 }} />
+                    </div>
+                  </div>
+                  <div style={{ fontSize: 10, color: "var(--muted)", marginTop: 8, lineHeight: 1.4 }}>
+                    Notifications die in dieses Fenster fallen, werden auf den Beginn der Wachzeit verschoben.
+                  </div>
+                </>
+              )}
+            </div>
+          )}
+
+          {/* Reminder-Defaults */}
+          {state.settings.notifications && (
+            <div className="card-sm">
+              <div style={{ fontWeight: 600, fontSize: 14, marginBottom: 10 }}>⏱️ Standard-Vorlaufzeiten</div>
+              <div style={{ fontSize: 11, color: "var(--muted)", marginBottom: 10, lineHeight: 1.4 }}>
+                Werden beim Anlegen von Tasks/Events vorausgewählt. Pro Item überschreibbar.
+              </div>
+              {[
+                { key: "defaultTaskReminder", label: "⚡ Task", default: 30 },
+                { key: "defaultEventReminder", label: "📅 Event", default: 30 },
+                { key: "defaultBirthdayReminder", label: "🎂 Geburtstag", default: 1440 },
+                { key: "defaultWorkoutReminder", label: "💪 Workout", default: 30 },
+              ].map(row => (
+                <div key={row.key} className="row" style={{ gap: 8, alignItems: "center", marginBottom: 6 }}>
+                  <span style={{ fontSize: 13, flex: 1 }}>{row.label}</span>
+                  <select
+                    className="select"
+                    value={state.settings[row.key] ?? row.default}
+                    onChange={e => dispatch({ type: "UPD_SETTINGS", payload: { [row.key]: Number(e.target.value) } })}
+                    style={{ width: 160, padding: "6px 10px", fontSize: 13 }}
+                  >
+                    <option value={0}>Keine</option>
+                    <option value={5}>5 Min vorher</option>
+                    <option value={15}>15 Min vorher</option>
+                    <option value={30}>30 Min vorher</option>
+                    <option value={60}>1 Std vorher</option>
+                    <option value={120}>2 Std vorher</option>
+                    <option value={1440}>1 Tag vorher</option>
+                    <option value={2880}>2 Tage vorher</option>
+                    <option value={10080}>1 Woche vorher</option>
+                  </select>
+                </div>
+              ))}
+            </div>
+          )}
+
           {/* Daten / Backup */}
           <div className="section-title">💾 Daten & Backup</div>
           <button className="btn btn-primary" onClick={exportData}><Download size={14} /> Backup exportieren</button>
@@ -3012,8 +3259,9 @@ function SettingsModal({ state, dispatch, onClose }) {
             <input type="file" accept=".json" onChange={e => e.target.files[0] && importData(e.target.files[0])} style={{ display: "none" }} />
           </label>
           <div className="card-sm">
-            <div className="stat-label">Schema-Version</div>
-            <div className="mono" style={{ fontSize: 12, marginTop: 4 }}>v{state.version} · {state.tasks.length} Tasks · {state.events.length} Events · {state.workouts.length} Workouts · {state.habits.length} Habits · {(state.notes||[]).length} Notizen</div>
+            <div className="stat-label">App-Version</div>
+            <div className="mono" style={{ fontSize: 14, marginTop: 4, color: "var(--lime)" }}>v{__APP_VERSION__}</div>
+            <div className="mono" style={{ fontSize: 11, marginTop: 6, color: "var(--muted)" }}>Schema v{state.version} · {state.tasks.length} Tasks · {state.events.length} Events · {state.workouts.length} Workouts · {state.habits.length} Habits · {(state.notes||[]).length} Notizen</div>
           </div>
 
           {/* Wipe (versteckt) */}
@@ -5972,6 +6220,55 @@ function AppInner() {
   const [showQuickAdd, setShowQuickAdd] = useState(false);
   const fabLongPressTimer = useRef(null);
 
+  // Notification action buttons — Erledigt / Snooze / Glückwunsch.
+  // The OS launches the app when the user taps an action; we look up the item via extra and dispatch.
+  useEffect(() => {
+    const isCap = typeof window !== "undefined" && !!window.Capacitor?.isNativePlatform?.();
+    if (!isCap) return;
+    let listener;
+    LocalNotifications.addListener("localNotificationActionPerformed", ({ actionId, notification }) => {
+      const extra = notification?.extra || {};
+      if (extra.kind === "task" && extra.taskId) {
+        if (actionId === "done") {
+          dispatch({ type: "MOVE_TASK", payload: { id: extra.taskId, status: "done" } });
+        } else if (actionId === "snooze15") {
+          // Re-fire same notification 15 minutes from now
+          const t = state.tasks.find(x => x.id === extra.taskId);
+          if (t) {
+            Notif.schedule({
+              id: `task-${t.id}-snooze-${Date.now()}`,
+              at: new Date(Date.now() + 15 * 60000),
+              title: `⚡ ${t.title}`,
+              body: "Snooze · 15 Min später",
+              actionTypeId: "task",
+              channelKey: "tasks",
+              extra: { taskId: t.id, kind: "task" },
+            });
+          }
+        } else if (actionId === "tap") {
+          setOpenTaskId(extra.taskId);
+        }
+      } else if (extra.kind === "habit" && extra.habitId) {
+        if (actionId === "done") {
+          dispatch({ type: "TOGGLE_HABIT", payload: { id: extra.habitId, date: localDate() } });
+        }
+      } else if (extra.kind === "birthday" && extra.eventId) {
+        if (actionId === "wish") {
+          // Open share sheet on Capacitor; on web fall back to navigator.share
+          const e = state.events.find(x => x.id === extra.eventId);
+          if (e && navigator.share) {
+            navigator.share({ title: "Geburtstagsgruß", text: `Alles Gute zum Geburtstag, ${(e.title || "").replace(/[\s']+Geburtstag\s*$/i, "")}! 🎂` }).catch(() => {});
+          }
+        } else if (actionId === "tap") {
+          setOpenEventId(extra.eventId);
+        }
+      } else if (extra.kind === "digest" || extra.kind === "nudge") {
+        // Just opens the app; no action needed
+      }
+    }).then(l => { listener = l; });
+    return () => { listener?.remove?.(); };
+  }, [state.tasks, state.events, dispatch]);
+
   // Back button — Android system back via @capacitor/app (proper, works in WebView).
   // Closes the topmost UI element; if nothing is open and we're on dashboard, exits the app.
   useEffect(() => {
@@ -6254,10 +6551,10 @@ function AppInner() {
           ))}
         </nav>
 
-        {showAddTask && <AddTaskModal onClose={() => setShowAddTask(false)} onAdd={t => dispatch({ type: "ADD_TASK", payload: t })} projects={state.projects} />}
-        {showAddEvent && <AddEventModal defaultDate={addEventDate} defaultType={quickAddType} onClose={() => { setShowAddEvent(false); setAddEventDate(null); setQuickAddType(null); }} onAdd={e => dispatch({ type: "ADD_EVENT", payload: e })} />}
-        {showAddWorkout && <AddWorkoutModal onClose={() => setShowAddWorkout(false)} onAdd={w => dispatch({ type: "ADD_WORKOUT", payload: w })} />}
-        {editingWorkout && <AddWorkoutModal editing={editingWorkout} onClose={() => setEditingWorkout(null)} onAdd={() => {}} onUpdate={w => dispatch({ type: "UPD_WORKOUT", payload: w })} onDelete={id => dispatch({ type: "DEL_WORKOUT", payload: id })} />}
+        {showAddTask && <AddTaskModal onClose={() => setShowAddTask(false)} onAdd={t => dispatch({ type: "ADD_TASK", payload: t })} projects={state.projects} settings={state.settings} />}
+        {showAddEvent && <AddEventModal defaultDate={addEventDate} defaultType={quickAddType} settings={state.settings} onClose={() => { setShowAddEvent(false); setAddEventDate(null); setQuickAddType(null); }} onAdd={e => dispatch({ type: "ADD_EVENT", payload: e })} />}
+        {showAddWorkout && <AddWorkoutModal settings={state.settings} onClose={() => setShowAddWorkout(false)} onAdd={w => dispatch({ type: "ADD_WORKOUT", payload: w })} />}
+        {editingWorkout && <AddWorkoutModal editing={editingWorkout} settings={state.settings} onClose={() => setEditingWorkout(null)} onAdd={() => {}} onUpdate={w => dispatch({ type: "UPD_WORKOUT", payload: w })} onDelete={id => dispatch({ type: "DEL_WORKOUT", payload: id })} />}
         {taskDetail && <TaskDetailModal task={taskDetail} onClose={() => setOpenTaskId(null)} dispatch={dispatch} projects={state.projects} openPomo={openPomo} />}
         {eventDetail && <EventDetailModal event={eventDetail} onClose={() => setOpenEventId(null)} dispatch={dispatch} />}
         {pomoTaskId && <PomodoroModal taskId={pomoTaskId} tasks={state.tasks} onClose={() => setPomoTaskId(null)} dispatch={dispatch} />}

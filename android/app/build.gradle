@@ -1,5 +1,13 @@
 apply plugin: 'com.android.application'
 
+import groovy.json.JsonSlurper
+
+// Read version from project root package.json — single source of truth across web + native.
+def packageJson = new JsonSlurper().parse(new File("$rootDir/../package.json"))
+def gsdVersionName = packageJson.version as String
+def gsdVersionParts = gsdVersionName.split('\\.').collect { it.toInteger() }
+def gsdVersionCode = gsdVersionParts[0] * 10000 + gsdVersionParts[1] * 100 + gsdVersionParts[2]
+
 android {
     namespace "com.gsd.app"
     compileSdk rootProject.ext.compileSdkVersion
@@ -7,8 +15,8 @@ android {
         applicationId "com.gsd.app"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 1
-        versionName "1.0"
+        versionCode gsdVersionCode
+        versionName gsdVersionName
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         aaptOptions {
              // Files and dirs to omit from the packaged assets dir, modified to accommodate modern web apps.
