@@ -2,6 +2,9 @@ import React, { useState, useEffect, useReducer, useRef, useMemo, useCallback } 
 import { createPortal } from "react-dom";
 import { LocalNotifications } from "@capacitor/local-notifications";
 import { App as CapApp } from "@capacitor/app";
+import { Filesystem, Directory, Encoding } from "@capacitor/filesystem";
+import { Share } from "@capacitor/share";
+import { Preferences } from "@capacitor/preferences";
 import {
   Home, CheckSquare, Calendar, Target, MoreHorizontal, Plus, X, Trash2, Check,
   ChevronLeft, ChevronRight, Clock, Search, Mic, Settings, Bell, Zap,
@@ -2937,7 +2940,38 @@ function SettingsModal({ state, dispatch, onClose }) {
     const json = JSON.stringify(state, null, 2);
     const filename = `gsd-backup-${localDate()}.json`;
     const sizeKB = (json.length / 1024).toFixed(1);
+    const isCap = typeof window !== "undefined" && !!window.Capacitor?.isNativePlatform?.();
 
+    // Native path on Capacitor: write a real file, share it via system share-sheet
+    if (isCap) {
+      try {
+        const written = await Filesystem.writeFile({
+          path: filename,
+          data: json,
+          directory: Directory.Cache,
+          encoding: Encoding.UTF8,
+        });
+        await Share.share({
+          title: "GSD Backup",
+          url: written.uri,
+          dialogTitle: "Backup speichern oder teilen",
+        });
+        return;
+      } catch (e) {
+        if (e?.message?.toLowerCase?.().includes("share canceled") || e?.message?.toLowerCase?.().includes("cancel")) return;
+        // Fall through to clipboard fallback
+        try {
+          await navigator.clipboard.writeText(json);
+          alert(`Native Share schlug fehl (${e?.message || "unbekannt"}). Backup wurde stattdessen in die Zwischenablage kopiert (${sizeKB} KB).`);
+          return;
+        } catch {
+          alert("Export fehlgeschlagen: " + (e?.message || "Unbekannter Fehler"));
+          return;
+        }
+      }
+    }
+
+    // Web path
     if (navigator.share) {
       try {
         const file = new File([json], filename, { type: "application/json" });
@@ -2947,7 +2981,6 @@ function SettingsModal({ state, dispatch, onClose }) {
         if (e?.name === "AbortError") return;
       }
     }
-
     let downloadAttempted = false;
     try {
       const blob = new Blob([json], { type: "application/json" });
@@ -2958,16 +2991,15 @@ function SettingsModal({ state, dispatch, onClose }) {
       setTimeout(() => URL.revokeObjectURL(url), 1000);
       downloadAttempted = true;
     } catch (e) {}
-
     try {
       await navigator.clipboard.writeText(json);
       alert(
         downloadAttempted
-          ? `Falls kein Download-Dialog kam: das Backup (${sizeKB} KB) liegt jetzt in der Zwischenablage. Füge es in einer Notiz, E-Mail oder Telegram an dich selbst ein, um es extern zu sichern.`
-          : `Backup wurde in die Zwischenablage kopiert (${sizeKB} KB). Füge es in einer Notiz, E-Mail oder Telegram an dich selbst ein, um es extern zu sichern.`
+          ? `Falls kein Download-Dialog kam: das Backup (${sizeKB} KB) liegt jetzt in der Zwischenablage.`
+          : `Backup wurde in die Zwischenablage kopiert (${sizeKB} KB).`
       );
     } catch (e) {
-      alert("Export fehlgeschlagen: " + (e?.message || "Browser blockiert Datei-Share, Download und Zwischenablage."));
+      alert("Export fehlgeschlagen: " + (e?.message || "Browser blockiert alles."));
     }
   };
   const importData = (file) => {
@@ -6219,6 +6251,92 @@ function AppInner() {
   const [showSplash, setShowSplash] = useState(true); // Splash IMMER beim Start
   const [showQuickAdd, setShowQuickAdd] = useState(false);
   const fabLongPressTimer = useRef(null);
+
+  // Widget state sync — write the today/tomorrow plan to Preferences (= Android SharedPreferences)
+  // so the native widget can read it. Triggers WidgetRefresh plugin to repaint widgets.
+  useEffect(() => {
+    const isCap = typeof window !== "undefined" && !!window.Capacitor?.isNativePlatform?.();
+    if (!isCap) return;
+    const today = localDate();
+    const dt = new Date(today + "T12:00:00");
+    const dayLabel = dt.toLocaleDateString("de-DE", { weekday: "short", day: "numeric", month: "long" });
+    const items = [];
+    const events = state.events.filter(e => getEventDates(e, today, today).includes(today) && !e.isHoliday);
+    const tasks = state.tasks.filter(t => getTaskDates(t, today, today).includes(today) && t.status !== "done");
+    const weekday = (dt.getDay() + 6) % 7;
+    const workouts = state.workouts.filter(w => w.weekday === weekday);
+    const habits = (state.habits || []).filter(h => {
+      if (h.frequency !== "daily") return false;
+      if (!h.weekdays || h.weekdays.length === 0) return true;
+      return h.weekdays.includes(weekday);
+    });
+    events.forEach(e => items.push({
+      icon: e.type === "birthday" ? "🎂" : e.type === "vacation" ? "✈️" : "📅",
+      time: e.startTime || "",
+      title: e.title,
+      deepLink: `gsd://event/${e.id}`,
+    }));
+    tasks.forEach(t => items.push({
+      icon: t.isFrog ? "💩" : "⚡",
+      time: t.startTime || "",
+      title: t.title,
+      deepLink: `gsd://task/${t.id}`,
+    }));
+    workouts.forEach(w => items.push({
+      icon: "💪",
+      time: w.time || "",
+      title: w.title,
+      deepLink: "gsd://sport",
+    }));
+    items.sort((a, b) => {
+      if (!a.time && b.time) return -1;
+      if (a.time && !b.time) return 1;
+      return (a.time || "").localeCompare(b.time || "");
+    });
+    const undoneHabits = habits.filter(h => !((h.completions || {})[today]));
+    const summary = [
+      events.length && `${events.length} Termin${events.length === 1 ? "" : "e"}`,
+      tasks.length && `${tasks.length} Aufgabe${tasks.length === 1 ? "" : "n"}`,
+      workouts.length && `${workouts.length} Sport`,
+      habits.length && `${undoneHabits.length}/${habits.length} Habits`,
+    ].filter(Boolean).join(" · ");
+    const widgetState = {
+      title: dayLabel.toUpperCase(),
+      summary: summary || "Heute steht nichts an",
+      items,
+      habits: habits.map(h => ({ emoji: h.emoji || "🔥", title: h.title, done: !!((h.completions || {})[today]) })),
+      generatedAt: Date.now(),
+    };
+    Preferences.set({ key: "widget_state", value: JSON.stringify(widgetState) }).then(() => {
+      // Tell native side to repaint widgets if our plugin is registered.
+      try { window.Capacitor?.Plugins?.WidgetRefresh?.refresh?.(); } catch {}
+    }).catch(() => {});
+  }, [state.events, state.tasks, state.workouts, state.habits]);
+
+  // Deep links — when the user taps a widget item or a notification action that carries a gsd:// URL,
+  // route to the right detail view in the SPA.
+  useEffect(() => {
+    const isCap = typeof window !== "undefined" && !!window.Capacitor?.isNativePlatform?.();
+    if (!isCap) return;
+    let listener;
+    CapApp.addListener("appUrlOpen", ({ url }) => {
+      if (!url) return;
+      let parsed;
+      try { parsed = new URL(url); } catch { return; }
+      const host = parsed.host || parsed.pathname.replace(/^\/+/, "").split("/")[0];
+      const segs = parsed.pathname.split("/").filter(Boolean);
+      if (host === "task" && segs.length >= 1) {
+        setOpenTaskId(segs[segs.length - 1]);
+      } else if (host === "event" && segs.length >= 1) {
+        setOpenEventId(segs[segs.length - 1]);
+      } else if (host === "sport") {
+        dispatch({ type: "SET_VIEW", payload: "sport" });
+      } else if (host === "heute" || host === "dashboard" || !host) {
+        dispatch({ type: "SET_VIEW", payload: "dashboard" });
+      }
+    }).then(l => { listener = l; });
+    return () => { listener?.remove?.(); };
+  }, [dispatch]);
 
   // Notification action buttons — Erledigt / Snooze / Glückwunsch.
   // The OS launches the app when the user taps an action; we look up the item via extra and dispatch.
