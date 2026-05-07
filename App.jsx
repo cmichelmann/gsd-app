@@ -2936,6 +2936,28 @@ function SettingsModal({ state, dispatch, onClose }) {
     else alert("Notifications wurden vom Browser/System nicht erlaubt.");
   };
   const disableNotifications = () => dispatch({ type: "UPD_SETTINGS", payload: { notifications: false } });
+  const exportToDocuments = async () => {
+    const isCap = typeof window !== "undefined" && !!window.Capacitor?.isNativePlatform?.();
+    if (!isCap) {
+      alert("Dieser Knopf funktioniert nur in der Android-App. Im Browser bitte 'Backup teilen' nehmen.");
+      return;
+    }
+    const json = JSON.stringify(state, null, 2);
+    const filename = `gsd-backup-${localDate()}.json`;
+    try {
+      const written = await Filesystem.writeFile({
+        path: filename,
+        data: json,
+        directory: Directory.Documents,
+        encoding: Encoding.UTF8,
+        recursive: true,
+      });
+      alert(`✓ Backup gespeichert\n\nIn: Documents/${filename}\n\nÖffne die Files-App auf'm Handy → "Eigene Dateien" / "Documents".`);
+    } catch (e) {
+      alert("Speichern fehlgeschlagen: " + (e?.message || "unbekannt"));
+    }
+  };
+
   const exportData = async () => {
     const json = JSON.stringify(state, null, 2);
     const filename = `gsd-backup-${localDate()}.json`;
@@ -3285,7 +3307,8 @@ function SettingsModal({ state, dispatch, onClose }) {
 
           {/* Daten / Backup */}
           <div className="section-title">💾 Daten & Backup</div>
-          <button className="btn btn-primary" onClick={exportData}><Download size={14} /> Backup exportieren</button>
+          <button className="btn btn-primary" onClick={exportData}><Download size={14} /> Backup teilen (Share-Sheet)</button>
+          <button className="btn btn-ghost" onClick={exportToDocuments}><Download size={14} /> In Documents-Ordner speichern</button>
           <label className="btn btn-ghost" style={{ cursor: "pointer" }}>
             <Upload size={14} /> Backup importieren
             <input type="file" accept=".json" onChange={e => e.target.files[0] && importData(e.target.files[0])} style={{ display: "none" }} />
