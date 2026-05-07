@@ -1,5 +1,7 @@
 import React, { useState, useEffect, useReducer, useRef, useMemo, useCallback } from "react";
 import { createPortal } from "react-dom";
+import { LocalNotifications } from "@capacitor/local-notifications";
+import { App as CapApp } from "@capacitor/app";
 import {
   Home, CheckSquare, Calendar, Target, MoreHorizontal, Plus, X, Trash2, Check,
   ChevronLeft, ChevronRight, Clock, Search, Mic, Settings, Bell, Zap,
@@ -950,18 +952,20 @@ function checkAchievements(state) {
 
 
 // ════════════════════════════════════════════════════════════════════════════
-// NOTIFICATIONS — Web today, Capacitor-ready for APK build
+// NOTIFICATIONS — Capacitor LocalNotifications when on Android, web fallback otherwise
 // ════════════════════════════════════════════════════════════════════════════
-// When running as APK with Capacitor, replace the body of these functions with
-// `import { LocalNotifications } from '@capacitor/local-notifications'`
-// and use LocalNotifications.schedule() / cancel() — same API shape.
 const Notif = {
-  isCapacitor: () => typeof window !== "undefined" && !!window.Capacitor,
+  isCapacitor: () => typeof window !== "undefined" && !!window.Capacitor?.isNativePlatform?.(),
+  toIntId(id) {
+    if (typeof id === "number") return Math.abs(id) % 2147483647;
+    return Math.abs(hashCode(String(id))) % 2147483647;
+  },
   async requestPermission() {
     if (this.isCapacitor()) {
-      // const { LocalNotifications } = await import('@capacitor/local-notifications');
-      // return (await LocalNotifications.requestPermissions()).display === "granted";
-      return true;
+      try {
+        const res = await LocalNotifications.requestPermissions();
+        return res.display === "granted";
+      } catch { return false; }
     }
     if (typeof Notification === "undefined") return false;
     if (Notification.permission === "granted") return true;
@@ -970,36 +974,36 @@ const Notif = {
     return r === "granted";
   },
   async schedule({ id, title, body, at, channelKey }) {
-    // channelKey: "tasks" | "events" | "birthdays" | "workouts" | "habits"
     if (!at) return;
     const delay = new Date(at).getTime() - Date.now();
-    if (delay < 0) return; // past — don't fire
+    if (delay < 0) return;
     if (this.isCapacitor()) {
-      // const { LocalNotifications } = await import('@capacitor/local-notifications');
-      // await LocalNotifications.schedule({ notifications: [{
-      //   id: typeof id === "number" ? id : Math.abs(hashCode(String(id))),
-      //   title, body, schedule: { at: new Date(at) },
-      //   extra: { channelKey }
-      // }] });
+      try {
+        await LocalNotifications.schedule({ notifications: [{
+          id: this.toIntId(id), title, body,
+          schedule: { at: new Date(at), allowWhileIdle: true },
+          extra: { channelKey },
+          smallIcon: "ic_stat_icon_config_sample",
+        }] });
+      } catch (e) { console.warn("LocalNotifications.schedule failed", e); }
       return;
     }
-    // Web fallback: only works while page is open. Schedule via setTimeout.
     if (typeof Notification === "undefined" || Notification.permission !== "granted") return;
-    if (delay > 2147483647) return; // setTimeout max
+    if (delay > 2147483647) return;
     setTimeout(() => {
       try { new Notification(title, { body, tag: String(id), icon: `${import.meta.env.BASE_URL}icon-192.png` }); } catch {}
     }, delay);
   },
-  async cancel(id) {
+  async cancelAllPending() {
     if (this.isCapacitor()) {
-      // const { LocalNotifications } = await import('@capacitor/local-notifications');
-      // await LocalNotifications.cancel({ notifications: [{ id: typeof id === "number" ? id : Math.abs(hashCode(String(id))) }] });
-      return;
+      try {
+        const pending = await LocalNotifications.getPending();
+        if (pending.notifications.length > 0) {
+          await LocalNotifications.cancel({ notifications: pending.notifications.map(n => ({ id: n.id })) });
+        }
+      } catch (e) { console.warn("LocalNotifications.cancelAll failed", e); }
     }
-    // Web: timeouts can't be reliably cancelled by id without tracking — best effort
   },
-  // Daily digest — schedule full-day plan at chosen time, for next 7 days.
-  // In Capacitor: native schedule survives app close. In web: only fires while open.
   async scheduleDailyDigest({ time, getStateForDate }) {
     if (!time) return;
     const [hh, mm] = time.split(":").map(Number);
@@ -1016,11 +1020,14 @@ const Notif = {
       });
     }
   },
-  // For test button — fire one immediately
   async fireNow({ title, body }) {
     if (this.isCapacitor()) {
-      // const { LocalNotifications } = await import('@capacitor/local-notifications');
-      // await LocalNotifications.schedule({ notifications: [{ id: Date.now() % 2147483647, title, body, schedule: { at: new Date(Date.now() + 1000) } }] });
+      try {
+        await LocalNotifications.schedule({ notifications: [{
+          id: Date.now() % 2147483647, title, body,
+          schedule: { at: new Date(Date.now() + 1000) },
+        }] });
+      } catch (e) { console.warn("LocalNotifications.fireNow failed", e); }
       return;
     }
     if (typeof Notification === "undefined" || Notification.permission !== "granted") {
@@ -1362,68 +1369,79 @@ function useDragDrop(onDrop) {
 
 function useNotifications(state) {
   const { tasks, events, workouts, habits, settings } = state;
-  const scheduledRef = useRef(new Set());
   useEffect(() => {
-    if (!settings.notifications) return;
-    const schedule = (key, fireAt, channelKey, title, body) => {
-      if (scheduledRef.current.has(key)) return;
-      if (fireAt <= Date.now()) return;
-      scheduledRef.current.add(key);
-      Notif.schedule({ id: key, title, body, at: new Date(fireAt), channelKey });
-    };
-    // Tasks
-    if (settings.notifTasks) {
-      tasks.forEach(t => {
-        if (!t.startDate || !t.startTime || !t.reminderMinutes || t.status === "done") return;
-        const dueMs = new Date(`${t.startDate}T${t.startTime}:00`).getTime();
-        schedule(`task-${t.id}-${dueMs}`, dueMs - t.reminderMinutes * 60000, "tasks", `⚡ ${t.title}`, `Beginnt um ${t.startTime} Uhr`);
-      });
+    if (!settings.notifications) {
+      // Notifications disabled — clear anything we previously scheduled
+      Notif.cancelAllPending();
+      return;
     }
-    // Events / Birthdays
-    (events || []).forEach(e => {
-      if (!e.startDate || !e.reminderMinutes || e.isHoliday) return;
-      const isBday = e.type === "birthday";
-      if (isBday && !settings.notifBirthdays) return;
-      if (!isBday && !settings.notifEvents) return;
-      const time = e.startTime || "09:00";
-      const dueMs = new Date(`${e.startDate}T${time}:00`).getTime();
-      const icon = isBday ? "🎂" : e.type === "vacation" ? "✈️" : "📅";
-      schedule(`event-${e.id}-${dueMs}`, dueMs - e.reminderMinutes * 60000, isBday ? "birthdays" : "events", `${icon} ${e.title}`, e.notes || "Erinnerung");
-    });
-    // Workouts (next 7 days)
-    if (settings.notifWorkouts) {
-      const today = new Date();
-      (workouts || []).forEach(w => {
-        if (!w.reminderMinutes) return;
-        for (let i = 0; i < 7; i++) {
-          const d = addDays(today, i);
-          if (((d.getDay() + 6) % 7) === w.weekday) {
-            const dateStr = localDate(d);
-            const dueMs = new Date(`${dateStr}T${w.time}:00`).getTime();
-            schedule(`workout-${w.id}-${dateStr}`, dueMs - w.reminderMinutes * 60000, "workouts", `💪 ${w.title}`, `${workoutTypeOf(w.type).label} um ${w.time}`);
+    let cancelled = false;
+    (async () => {
+      // Reset every time data changes — guarantees deleted items don't keep firing
+      await Notif.cancelAllPending();
+      if (cancelled) return;
+      const seen = new Set();
+      const schedule = (key, fireAt, channelKey, title, body) => {
+        if (seen.has(key)) return;
+        if (fireAt <= Date.now()) return;
+        seen.add(key);
+        Notif.schedule({ id: key, title, body, at: new Date(fireAt), channelKey });
+      };
+      // Tasks
+      if (settings.notifTasks) {
+        tasks.forEach(t => {
+          if (!t.startDate || !t.startTime || !t.reminderMinutes || t.status === "done") return;
+          const dueMs = new Date(`${t.startDate}T${t.startTime}:00`).getTime();
+          schedule(`task-${t.id}-${dueMs}`, dueMs - t.reminderMinutes * 60000, "tasks", `⚡ ${t.title}`, `Beginnt um ${t.startTime} Uhr`);
+        });
+      }
+      // Events / Birthdays
+      (events || []).forEach(e => {
+        if (!e.startDate || !e.reminderMinutes || e.isHoliday) return;
+        const isBday = e.type === "birthday";
+        if (isBday && !settings.notifBirthdays) return;
+        if (!isBday && !settings.notifEvents) return;
+        const time = e.startTime || "09:00";
+        const dueMs = new Date(`${e.startDate}T${time}:00`).getTime();
+        const icon = isBday ? "🎂" : e.type === "vacation" ? "✈️" : "📅";
+        schedule(`event-${e.id}-${dueMs}`, dueMs - e.reminderMinutes * 60000, isBday ? "birthdays" : "events", `${icon} ${e.title}`, e.notes || "Erinnerung");
+      });
+      // Workouts (next 7 days)
+      if (settings.notifWorkouts) {
+        const today = new Date();
+        (workouts || []).forEach(w => {
+          if (!w.reminderMinutes) return;
+          for (let i = 0; i < 7; i++) {
+            const d = addDays(today, i);
+            if (((d.getDay() + 6) % 7) === w.weekday) {
+              const dateStr = localDate(d);
+              const dueMs = new Date(`${dateStr}T${w.time}:00`).getTime();
+              schedule(`workout-${w.id}-${dateStr}`, dueMs - w.reminderMinutes * 60000, "workouts", `💪 ${w.title}`, `${workoutTypeOf(w.type).label} um ${w.time}`);
+            }
           }
-        }
-      });
-    }
-    // Habits — daily 08:00 reminder for next 7 days
-    if (settings.notifHabits) {
-      const today = new Date();
-      (habits || []).forEach(h => {
-        for (let i = 0; i < 7; i++) {
-          const d = addDays(today, i);
-          const dateStr = localDate(d);
-          const dueMs = new Date(`${dateStr}T08:00:00`).getTime();
-          schedule(`habit-${h.id}-${dateStr}`, dueMs, "habits", `${h.emoji || "🔥"} ${h.title}`, "Habit-Erinnerung");
-        }
-      });
-    }
-    // Daily digest — full day plan at chosen time
-    if (settings.dailyDigest && settings.dailyDigestTime) {
-      Notif.scheduleDailyDigest({
-        time: settings.dailyDigestTime,
-        getStateForDate: (dateStr) => buildDigestBody(state, dateStr),
-      });
-    }
+        });
+      }
+      // Habits — daily 08:00 reminder for next 7 days
+      if (settings.notifHabits) {
+        const today = new Date();
+        (habits || []).forEach(h => {
+          for (let i = 0; i < 7; i++) {
+            const d = addDays(today, i);
+            const dateStr = localDate(d);
+            const dueMs = new Date(`${dateStr}T08:00:00`).getTime();
+            schedule(`habit-${h.id}-${dateStr}`, dueMs, "habits", `${h.emoji || "🔥"} ${h.title}`, "Habit-Erinnerung");
+          }
+        });
+      }
+      // Daily digest — full day plan at chosen time
+      if (settings.dailyDigest && settings.dailyDigestTime) {
+        Notif.scheduleDailyDigest({
+          time: settings.dailyDigestTime,
+          getStateForDate: (dateStr) => buildDigestBody(state, dateStr),
+        });
+      }
+    })();
+    return () => { cancelled = true; };
   }, [tasks, events, workouts, habits, settings.notifications, settings.notifTasks, settings.notifEvents, settings.notifBirthdays, settings.notifWorkouts, settings.notifHabits, settings.dailyDigest, settings.dailyDigestTime]);
 }
 
@@ -5954,35 +5972,41 @@ function AppInner() {
   const [showQuickAdd, setShowQuickAdd] = useState(false);
   const fabLongPressTimer = useRef(null);
 
-  // Back button (Android system back / browser back) — navigate within the app instead of exiting.
-  // We push a single "guard" history entry on mount and re-push it after each handled back press.
-  // When nothing is open and the user presses back, no re-push happens → the next press exits the app.
+  // Back button — Android system back via @capacitor/app (proper, works in WebView).
+  // Closes the topmost UI element; if nothing is open and we're on dashboard, exits the app.
   useEffect(() => {
+    const handleBack = () => {
+      if (showRitual) { setShowRitual(false); return true; }
+      if (showSearch) { setShowSearch(false); return true; }
+      if (showSettings) { setShowSettings(false); return true; }
+      if (showQuickAdd) { setShowQuickAdd(false); return true; }
+      if (showAddTask) { setShowAddTask(false); return true; }
+      if (showAddEvent) { setShowAddEvent(false); setAddEventDate(null); setQuickAddType(null); return true; }
+      if (showAddWorkout) { setShowAddWorkout(false); return true; }
+      if (editingWorkout) { setEditingWorkout(null); return true; }
+      if (pomoTaskId) { setPomoTaskId(null); return true; }
+      if (openTaskId) { setOpenTaskId(null); return true; }
+      if (openEventId) { setOpenEventId(null); return true; }
+      if (state.view === "more" && moreSubView) { setMoreSubView(null); return true; }
+      if (state.view !== "dashboard") { dispatch({ type: "SET_VIEW", payload: "dashboard" }); return true; }
+      return false;
+    };
+    const isCap = typeof window !== "undefined" && !!window.Capacitor?.isNativePlatform?.();
+    if (isCap) {
+      let listener;
+      CapApp.addListener("backButton", () => {
+        if (!handleBack()) {
+          CapApp.exitApp().catch(() => {});
+        }
+      }).then(l => { listener = l; });
+      return () => { listener?.remove?.(); };
+    }
+    // Browser fallback
+    const onPop = () => { handleBack(); };
+    window.addEventListener("popstate", onPop);
     if (window.history.state?.gsdGuard !== true) {
       window.history.pushState({ gsdGuard: true }, "");
     }
-  }, []);
-  useEffect(() => {
-    const onPop = () => {
-      let didClose = false;
-      if (showRitual) { setShowRitual(false); didClose = true; }
-      else if (showSearch) { setShowSearch(false); didClose = true; }
-      else if (showSettings) { setShowSettings(false); didClose = true; }
-      else if (showQuickAdd) { setShowQuickAdd(false); didClose = true; }
-      else if (showAddTask) { setShowAddTask(false); didClose = true; }
-      else if (showAddEvent) { setShowAddEvent(false); setAddEventDate(null); setQuickAddType(null); didClose = true; }
-      else if (showAddWorkout) { setShowAddWorkout(false); didClose = true; }
-      else if (editingWorkout) { setEditingWorkout(null); didClose = true; }
-      else if (pomoTaskId) { setPomoTaskId(null); didClose = true; }
-      else if (openTaskId) { setOpenTaskId(null); didClose = true; }
-      else if (openEventId) { setOpenEventId(null); didClose = true; }
-      else if (state.view === "more" && moreSubView) { setMoreSubView(null); didClose = true; }
-      else if (state.view !== "dashboard") { dispatch({ type: "SET_VIEW", payload: "dashboard" }); didClose = true; }
-      if (didClose) {
-        window.history.pushState({ gsdGuard: true }, "");
-      }
-    };
-    window.addEventListener("popstate", onPop);
     return () => window.removeEventListener("popstate", onPop);
   }, [showRitual, showSearch, showSettings, showQuickAdd, showAddTask, showAddEvent, showAddWorkout, editingWorkout, pomoTaskId, openTaskId, openEventId, moreSubView, state.view]);
 
