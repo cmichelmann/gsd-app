@@ -230,7 +230,7 @@ html, body, #root { height: 100%; background: #000; color: var(--text); overflow
 // ════════════════════════════════════════════════════════════════════════════
 // SCHEMA & MIGRATIONS
 // ════════════════════════════════════════════════════════════════════════════
-const SCHEMA_VERSION = 8;
+const SCHEMA_VERSION = 9;
 const STORAGE_KEY = "gsd-data";
 
 // localStorage wrapper that mimics Claude's window.storage API
@@ -351,6 +351,10 @@ const migrations = {
       },
     };
   },
+  9: (d) => ({
+    ...d, version: 9,
+    workouts: (d.workouts || []).map(w => ({ ...w, completions: w.completions || {} })),
+  }),
 };
 
 function migrate(raw) {
@@ -1197,7 +1201,7 @@ function reducer(state, { type, payload }) {
               const e = new Date(next + "T12:00:00"); e.setDate(e.getDate() + dur);
               newEnd = localDate(e);
             }
-            return { ...t, completionHistory: history, startDate: next, endDate: newEnd, status: "todo", completedAt: undefined };
+            return { ...t, completionHistory: history, startDate: next, endDate: newEnd, status: "backlog", completedAt: undefined };
           }
           // No next occurrence: actually mark done.
           return { ...t, completionHistory: history, status: "done", completedAt: Date.now() };
@@ -1243,9 +1247,10 @@ function reducer(state, { type, payload }) {
     case "ADD_EVENT":   return touch({ ...state, events: [...state.events, payload] });
     case "UPD_EVENT":   return touch({ ...state, events: state.events.map(e => e.id === payload.id ? { ...e, ...payload } : e) });
     case "DEL_EVENT":   return touch({ ...state, events: state.events.filter(e => e.id !== payload), tasks: state.tasks.filter(t => t.giftEventId !== payload) });
-    case "ADD_WORKOUT": return touch({ ...state, workouts: [...state.workouts, payload] });
+    case "ADD_WORKOUT": return touch({ ...state, workouts: [...state.workouts, { ...payload, completions: payload.completions || {} }] });
     case "UPD_WORKOUT": return touch({ ...state, workouts: state.workouts.map(w => w.id === payload.id ? { ...w, ...payload } : w) });
     case "DEL_WORKOUT": return touch({ ...state, workouts: state.workouts.filter(w => w.id !== payload) });
+    case "TOGGLE_WORKOUT": return touch({ ...state, workouts: state.workouts.map(w => w.id === payload.id ? { ...w, completions: { ...(w.completions || {}), [payload.date]: !(w.completions || {})[payload.date] } } : w) });
     case "ADD_HABIT":    return touch({ ...state, habits: [...state.habits, payload] });
     case "DEL_HABIT":    return touch({ ...state, habits: state.habits.filter(h => h.id !== payload) });
     case "TOGGLE_HABIT": return touch({ ...state, habits: state.habits.map(h => h.id === payload.id ? { ...h, completions: { ...h.completions, [payload.date]: !h.completions[payload.date] } } : h) });
@@ -1588,7 +1593,7 @@ function AddTaskModal({ onClose, onAdd, projects }) {
   const [notes, setNotes] = useState("");
   const [cat, setCat] = useState("privat");
   const [prio, setPrio] = useState(2);
-  const [status, setStatus] = useState("todo");
+  const [status, setStatus] = useState("backlog");
   const [allDay, setAllDay] = useState(true);
   const [startDate, setStartDate] = useState(localDate());
   const [endDate, setEndDate] = useState("");
@@ -2037,6 +2042,11 @@ function TaskDetailModal({ task, onClose, dispatch, projects, openPomo }) {
             <button className="btn btn-primary" onClick={() => { onClose(); openPomo(task.id); }}><Play size={14} /> POMODORO</button>
           </div>
         </div>
+        {task.status === "done" && (
+          <button className="btn btn-ghost" style={{ width: "100%", marginBottom: 8 }} onClick={() => { dispatch({ type: "UPD_TASK", payload: { id: task.id, archived: !task.archived } }); onClose(); }}>
+            {task.archived ? <><Upload size={14} /> WIEDERHERSTELLEN</> : <><Download size={14} /> ARCHIVIEREN</>}
+          </button>
+        )}
         <button className="btn btn-danger" style={{ width: "100%" }} onClick={() => { dispatch({ type: "DEL_TASK", payload: task.id }); onClose(); }}>
           <Trash2 size={14} /> LÖSCHEN
         </button>
@@ -3135,6 +3145,7 @@ function DashboardView({ state, dispatch, openTask, openEvent, openPomo, setShow
     fireCelebration();
   };
   const toggleHabit = (id, date) => dispatch({ type: "TOGGLE_HABIT", payload: { id, date } });
+  const toggleWorkout = (id, date) => dispatch({ type: "TOGGLE_WORKOUT", payload: { id, date } });
 
   // Reusable item renderer
   const renderItem = (it, dateStr) => {
@@ -3171,14 +3182,19 @@ function DashboardView({ state, dispatch, openTask, openEvent, openPomo, setShow
     }
     if (it.kind === "workout") {
       const w = it.item;
+      const done = !!(w.completions || {})[dateStr];
+      const isToday = dateStr === today;
       return (
-        <div key={it.id} className="card-sm" style={{ marginBottom: 6, borderLeft: `3px solid ${w.color}` }}>
+        <div key={it.id} onClick={() => isToday && toggleWorkout(w.id, dateStr)} className="card-sm" style={{ marginBottom: 6, cursor: isToday ? "pointer" : "default", borderLeft: `3px solid ${w.color}`, opacity: isToday ? 1 : 0.85 }}>
           <div className="between">
             <div className="row" style={{ flex: 1, minWidth: 0 }}>
               <Dumbbell size={14} color={w.color} />
-              <span style={{ fontSize: 13, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>💪 {w.title}</span>
+              <span style={{ fontSize: 13, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", textDecoration: done ? "line-through" : "none", opacity: done ? 0.55 : 1 }}>💪 {w.title}</span>
             </div>
-            {w.time && <span className="mono" style={{ fontSize: 11, color: "var(--muted)" }}>{w.time}</span>}
+            <div className="row" style={{ gap: 8 }}>
+              {w.time && <span className="mono" style={{ fontSize: 11, color: "var(--muted)" }}>{w.time}</span>}
+              {isToday && <span className={`chk ${done ? "on" : ""}`}>{done && <Check size={12} color="#000" strokeWidth={3} />}</span>}
+            </div>
           </div>
         </div>
       );
@@ -3315,6 +3331,7 @@ function DashboardView({ state, dispatch, openTask, openEvent, openPomo, setShow
 
 function TasksView({ state, dispatch, openTask }) {
   const [filter, setFilter] = useState("all");
+  const [showArchived, setShowArchived] = useState(false);
   const onDrop = useCallback((id, status) => {
     dispatch({ type: "MOVE_TASK", payload: { id, status } });
     if (status === "done") fireCelebration();
@@ -3341,8 +3358,11 @@ function TasksView({ state, dispatch, openTask }) {
       <div className="kanban">
         {STATUSES.map(col => {
           let colTasks = filtered.filter(t => t.status === col.id);
-          // For "done" column, also include historical completions of recurring tasks
+          // For "done" column: hide archived by default, append historical completions of recurring tasks
+          let archivedCount = 0;
           if (col.id === "done") {
+            archivedCount = colTasks.filter(t => t.archived).length;
+            if (!showArchived) colTasks = colTasks.filter(t => !t.archived);
             const histEntries = [];
             filtered.forEach(t => {
               if (!t.recurrence || t.recurrence.type === "none") return;
@@ -3366,6 +3386,11 @@ function TasksView({ state, dispatch, openTask }) {
                 </div>
                 <span style={{ background: "var(--s2)", borderRadius: 20, padding: "1px 8px", fontSize: 11, color: "var(--muted)" }}>{colTasks.length}</span>
               </div>
+              {col.id === "done" && archivedCount > 0 && (
+                <button onClick={() => setShowArchived(v => !v)} className="btn btn-ghost" style={{ width: "100%", padding: "4px 8px", fontSize: 10, marginBottom: 8, color: "var(--muted)", letterSpacing: "0.04em", textTransform: "uppercase" }}>
+                  {showArchived ? `📤 ${archivedCount} archivierte ausblenden` : `📦 ${archivedCount} archivierte anzeigen`}
+                </button>
+              )}
               {colTasks.map(t => (
                 <div key={t.id}
                   className={`task-card ${drag.id === t.id ? "dragging" : ""} ${t.status === "done" ? "done-card" : ""}`}
@@ -4162,6 +4187,17 @@ function SportView({ state, dispatch, setShowAddWorkout, setEditingWorkout }) {
   }, [state.workouts]);
   const totalThisWeek = state.workouts.length;
   const totalMinutes = state.workouts.reduce((a, w) => a + (w.duration || 0), 0);
+
+  // Last 7 days completion strip — show day done if at least one scheduled workout was checked off on that date.
+  const week = useMemo(() => Array.from({ length: 7 }, (_, i) => {
+    const d = new Date(); d.setDate(d.getDate() - 6 + i);
+    const ds = localDate(d);
+    const wd = (d.getDay() + 6) % 7;
+    const scheduled = state.workouts.filter(w => w.weekday === wd);
+    const done = scheduled.length > 0 && scheduled.some(w => (w.completions || {})[ds]);
+    return { date: ds, label: DAYS_SHORT[wd], hasScheduled: scheduled.length > 0, done };
+  }), [state.workouts]);
+
   return (
     <div className="view">
       <div className="between" style={{ marginBottom: 14 }}>
@@ -4169,6 +4205,17 @@ function SportView({ state, dispatch, setShowAddWorkout, setEditingWorkout }) {
         <button className="btn btn-primary" onClick={() => setShowAddWorkout(true)} style={{ padding: "7px 11px", fontSize: 11 }}>
           <Plus size={13} /> WORKOUT
         </button>
+      </div>
+      <div className="card" style={{ marginBottom: 14 }}>
+        <div className="stat-label" style={{ marginBottom: 10 }}>Letzte 7 Tage</div>
+        <div className="row" style={{ gap: 4, justifyContent: "space-between" }}>
+          {week.map(d => (
+            <div key={d.date} style={{ flex: 1, padding: "9px 0", borderRadius: 6, border: d.date === today ? "1.5px solid var(--lime)" : "1px solid var(--border)", background: d.done ? "var(--lime)" : "var(--s2)", color: d.done ? "#000" : "var(--muted)", fontSize: 11, textAlign: "center" }}>
+              <div className="mono" style={{ fontSize: 9, marginBottom: 1 }}>{d.label}</div>
+              {d.done ? <Check size={11} strokeWidth={3} style={{ display: "inline" }} /> : (d.hasScheduled ? "·" : "—")}
+            </div>
+          ))}
+        </div>
       </div>
       <div className="stat-grid" style={{ marginBottom: 14 }}>
         <div className="stat-tile"><div className="stat-label">Pro Woche</div>
@@ -5906,6 +5953,38 @@ function AppInner() {
   const [showSplash, setShowSplash] = useState(true); // Splash IMMER beim Start
   const [showQuickAdd, setShowQuickAdd] = useState(false);
   const fabLongPressTimer = useRef(null);
+
+  // Back button (Android system back / browser back) — navigate within the app instead of exiting.
+  // We push a single "guard" history entry on mount and re-push it after each handled back press.
+  // When nothing is open and the user presses back, no re-push happens → the next press exits the app.
+  useEffect(() => {
+    if (window.history.state?.gsdGuard !== true) {
+      window.history.pushState({ gsdGuard: true }, "");
+    }
+  }, []);
+  useEffect(() => {
+    const onPop = () => {
+      let didClose = false;
+      if (showRitual) { setShowRitual(false); didClose = true; }
+      else if (showSearch) { setShowSearch(false); didClose = true; }
+      else if (showSettings) { setShowSettings(false); didClose = true; }
+      else if (showQuickAdd) { setShowQuickAdd(false); didClose = true; }
+      else if (showAddTask) { setShowAddTask(false); didClose = true; }
+      else if (showAddEvent) { setShowAddEvent(false); setAddEventDate(null); setQuickAddType(null); didClose = true; }
+      else if (showAddWorkout) { setShowAddWorkout(false); didClose = true; }
+      else if (editingWorkout) { setEditingWorkout(null); didClose = true; }
+      else if (pomoTaskId) { setPomoTaskId(null); didClose = true; }
+      else if (openTaskId) { setOpenTaskId(null); didClose = true; }
+      else if (openEventId) { setOpenEventId(null); didClose = true; }
+      else if (state.view === "more" && moreSubView) { setMoreSubView(null); didClose = true; }
+      else if (state.view !== "dashboard") { dispatch({ type: "SET_VIEW", payload: "dashboard" }); didClose = true; }
+      if (didClose) {
+        window.history.pushState({ gsdGuard: true }, "");
+      }
+    };
+    window.addEventListener("popstate", onPop);
+    return () => window.removeEventListener("popstate", onPop);
+  }, [showRitual, showSearch, showSettings, showQuickAdd, showAddTask, showAddEvent, showAddWorkout, editingWorkout, pomoTaskId, openTaskId, openEventId, moreSubView, state.view]);
 
   // LOAD
   useEffect(() => {
