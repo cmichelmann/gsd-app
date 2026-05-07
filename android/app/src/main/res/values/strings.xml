@@ -4,4 +4,6 @@
     <string name="title_activity_main">GET SHIT DONE</string>
     <string name="package_name">com.gsd.app</string>
     <string name="custom_url_scheme">com.gsd.app</string>
+    <string name="widget_4x2_description">GSD Heute · Kompakt</string>
+    <string name="widget_4x4_description">GSD Heute · Voll mit Habits</string>
 </resources>
