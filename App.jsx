@@ -6298,23 +6298,38 @@ function AppInner() {
       time: e.startTime || "",
       title: e.title,
       deepLink: `gsd://event/${e.id}`,
+      accent: e.color || (e.type === "birthday" ? "#FF2D78" : e.type === "vacation" ? "#FF6B35" : "#00E0FF"),
     }));
     tasks.forEach(t => items.push({
       icon: t.isFrog ? "💩" : "⚡",
       time: t.startTime || "",
       title: t.title,
       deepLink: `gsd://task/${t.id}`,
+      accent: catOf(t.category)?.color || "#AAFF00",
     }));
     workouts.forEach(w => items.push({
       icon: "💪",
       time: w.time || "",
       title: w.title,
       deepLink: "gsd://sport",
+      accent: w.color || "#AAFF00",
     }));
+    // Sort timed items by time, then untimed items go after
     items.sort((a, b) => {
-      if (!a.time && b.time) return -1;
-      if (a.time && !b.time) return 1;
+      if (!a.time && b.time) return 1;
+      if (a.time && !b.time) return -1;
       return (a.time || "").localeCompare(b.time || "");
+    });
+    // Habits at the end — show all, mark done with check prefix
+    habits.forEach(h => {
+      const done = !!((h.completions || {})[today]);
+      items.push({
+        icon: h.emoji || "🔥",
+        time: "",
+        title: done ? `✓  ${h.title}` : h.title,
+        deepLink: "gsd://heute",
+        accent: h.color || "#FF6B35",
+      });
     });
     const undoneHabits = habits.filter(h => !((h.completions || {})[today]));
     const summary = [
@@ -6327,7 +6342,6 @@ function AppInner() {
       title: dayLabel.toUpperCase(),
       summary: summary || "Heute steht nichts an",
       items,
-      habits: habits.map(h => ({ emoji: h.emoji || "🔥", title: h.title, done: !!((h.completions || {})[today]) })),
       generatedAt: Date.now(),
     };
     Preferences.set({ key: "widget_state", value: JSON.stringify(widgetState) }).then(() => {

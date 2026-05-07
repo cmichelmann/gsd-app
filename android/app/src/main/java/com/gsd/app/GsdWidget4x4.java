@@ -8,7 +8,7 @@ public class GsdWidget4x4 extends AppWidgetProvider {
     @Override
     public void onUpdate(Context context, AppWidgetManager mgr, int[] ids) {
         for (int id : ids) {
-            WidgetHelper.updateWidget(context, mgr, id, R.layout.widget_4x4, 6);
+            WidgetHelper.updateWidget(context, mgr, id, R.layout.widget_4x4);
         }
     }
 }

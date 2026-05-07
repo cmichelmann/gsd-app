@@ -50,6 +50,11 @@
                 android:resource="@xml/widget_info_4x4" />
         </receiver>
 
+        <service
+            android:name=".WidgetItemsService"
+            android:permission="android.permission.BIND_REMOTEVIEWS"
+            android:exported="false" />
+
         <provider
             android:name="androidx.core.content.FileProvider"
             android:authorities="${applicationId}.fileprovider"
