@@ -1012,19 +1012,21 @@ function isSuperEvent(e, settings, occurrenceDate) {
   return true;
 }
 
-// Generate 30-min burst fire-times from `startMs`, 48h window, skipping quiet-hours slots.
+// Generate 30-min burst fire-times. Only schedules the *near-term* window so a birthday
+// weeks away doesn't pre-schedule dozens of alarms now (that saturated the bridge → ANR).
+// Window = [max(startMs, now), now + 48h]. The daily re-sync rolls it forward as the date nears.
 function superBurstTimes(startMs, quietHours) {
-  const times = [];
+  const now = Date.now();
   const INTERVAL = 30 * 60 * 1000;
-  const WINDOW = 48 * 60 * 60 * 1000;
-  const HARD_CAP = 70; // safety vs Android's per-app pending-notification limit
-  let t = startMs;
-  const end = startMs + WINDOW;
+  const HARD_CAP = 36; // ≤ 36 per item; global cap also applies in useNotifications
+  const start = Math.max(startMs, now + 60 * 1000);
+  const end = now + 48 * 60 * 60 * 1000;
+  if (start > end) return []; // reminder is further than 48h out — nothing yet
+  const times = [];
+  let t = start;
   while (t <= end && times.length < HARD_CAP) {
     const shifted = shiftIntoWakingHours(new Date(t), quietHours);
-    // shiftIntoWakingHours returns the same date if outside quiet hours; if it moved it, the slot
-    // was inside quiet hours → skip it entirely (don't stack everything onto wake-up time)
-    if (shifted.getTime() === t && t > Date.now()) times.push(t);
+    if (shifted.getTime() === t) times.push(t);
     t += INTERVAL;
   }
   return times;
@@ -1109,6 +1111,44 @@ const Notif = {
     setTimeout(() => {
       try { new Notification(title, { body: largeBody || body, tag: String(id), icon: `${import.meta.env.BASE_URL}icon-192.png` }); } catch {}
     }, delay);
+  },
+  // Batched scheduling — ONE bridge call for many notifications. Scheduling hundreds of
+  // notifications via individual schedule() awaits saturated the Capacitor bridge and
+  // ANR-killed the app. `list` items: { id, title, body, largeBody, at, channelKey,
+  // actionTypeId, extra }. Already-shifted/filtered by the caller.
+  async scheduleMany(list) {
+    if (!list || list.length === 0) return;
+    if (this.isCapacitor()) {
+      try {
+        await this.ensureActionTypesRegistered();
+        const notifications = list.map(n => {
+          const o = {
+            id: this.toIntId(n.id), title: n.title, body: n.body,
+            schedule: { at: new Date(n.at), allowWhileIdle: true },
+            extra: { channelKey: n.channelKey, ...(n.extra || {}) },
+            smallIcon: "ic_stat_icon_config_sample",
+          };
+          if (n.largeBody) o.largeBody = n.largeBody;
+          if (n.actionTypeId) o.actionTypeId = n.actionTypeId;
+          return o;
+        });
+        // Chunk to keep each bridge payload small (Android handles big arrays, but be safe)
+        const CHUNK = 50;
+        for (let i = 0; i < notifications.length; i += CHUNK) {
+          await LocalNotifications.schedule({ notifications: notifications.slice(i, i + CHUNK) });
+        }
+      } catch (e) { console.warn("LocalNotifications.scheduleMany failed", e); }
+      return;
+    }
+    // Web fallback: setTimeout each (only fires while page open)
+    if (typeof Notification === "undefined" || Notification.permission !== "granted") return;
+    list.forEach(n => {
+      const delay = new Date(n.at).getTime() - Date.now();
+      if (delay < 0 || delay > 2147483647) return;
+      setTimeout(() => {
+        try { new Notification(n.title, { body: n.largeBody || n.body, tag: String(n.id), icon: `${import.meta.env.BASE_URL}icon-192.png` }); } catch {}
+      }, delay);
+    });
   },
   async cancelAllPending() {
     if (this.isCapacitor()) {
@@ -1533,19 +1573,20 @@ function useNotifications(state) {
       start: settings.quietHoursStart || "22:00",
       end: settings.quietHoursEnd || "07:00",
     };
-    const schedule = (opts) => {
-      if (cancelled) return;
-      Notif.schedule({ ...opts, quietHours });
-    };
     (async () => {
+     try {
       await Notif.cancelAllPending();
       if (cancelled) return;
       const seen = new Set();
+      const queue = [];
+      const GLOBAL_CAP = 180; // hard ceiling across everything — never flood the bridge
       const safeSchedule = (key, fireAt, opts) => {
         if (seen.has(key)) return;
-        if (fireAt <= Date.now()) return;
+        if (queue.length >= GLOBAL_CAP) return;
+        const shifted = shiftIntoWakingHours(new Date(fireAt), quietHours);
+        if (shifted.getTime() <= Date.now()) return;
         seen.add(key);
-        schedule({ id: key, at: new Date(fireAt), ...opts });
+        queue.push({ id: key, at: shifted, ...opts });
       };
       // Tasks (only those with startTime — untimed land in morning nudge)
       if (settings.notifTasks) {
@@ -1669,6 +1710,12 @@ function useNotifications(state) {
           });
         }
       }
+      if (cancelled) return;
+      // ONE batched bridge call for everything — this is the ANR fix
+      await Notif.scheduleMany(queue);
+     } catch (e) {
+      console.warn("useNotifications sync failed", e);
+     }
     })();
     return () => { cancelled = true; };
   }, [tasks, events, workouts, habits, settings.notifications, settings.notifTasks, settings.notifEvents, settings.notifBirthdays, settings.notifWorkouts, settings.notifHabits, settings.dailyDigest, settings.dailyDigestTime, settings.morningNudgeEnabled, settings.morningNudgeTime, settings.quietHoursEnabled, settings.quietHoursStart, settings.quietHoursEnd]);
