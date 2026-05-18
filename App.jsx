@@ -235,7 +235,7 @@ html, body, #root { height: 100%; background: #000; color: var(--text); overflow
 // ════════════════════════════════════════════════════════════════════════════
 // SCHEMA & MIGRATIONS
 // ════════════════════════════════════════════════════════════════════════════
-const SCHEMA_VERSION = 10;
+const SCHEMA_VERSION = 11;
 const STORAGE_KEY = "gsd-data";
 
 // localStorage wrapper that mimics Claude's window.storage API
@@ -282,6 +282,8 @@ function getDefaults() {
       quietHoursEnabled: true, quietHoursStart: "22:00", quietHoursEnd: "07:00",
       // Morning nudge — one consolidated notification for habits + untimed tasks + day-of birthdays
       morningNudgeEnabled: true, morningNudgeTime: "09:00",
+      // Super-Penetrations-Modus for every birthday (per-item flag overridden by this when on)
+      superModeAllBirthdays: false,
       calendarFilters: { tasks: true, events: true, vacation: true, birthdays: true, holidays: true, habits: true, sport: true },
       searchHistory: [],
       featureGratitude: true, featureAchievements: true, featureHeatmap: true,
@@ -374,6 +376,10 @@ const migrations = {
       morningNudgeEnabled: true, morningNudgeTime: "09:00",
       ...(d.settings || {}),
     },
+  }),
+  11: (d) => ({
+    ...d, version: 11,
+    settings: { superModeAllBirthdays: false, ...(d.settings || {}) },
   }),
 };
 
@@ -996,6 +1002,34 @@ function shiftIntoWakingHours(at, quietHours) {
   return shifted;
 }
 
+// Is this task/event in Super-Penetrations-Modus right now (per-item flag, or global birthday switch)?
+function isSuperTask(t) { return !!t.superMode && t.status !== "done"; }
+function isSuperEvent(e, settings, occurrenceDate) {
+  if (e.isHoliday) return false;
+  const on = !!e.superMode || (e.type === "birthday" && !!settings?.superModeAllBirthdays);
+  if (!on) return false;
+  if (occurrenceDate && e.superAckDate === occurrenceDate) return false; // acked for this occurrence
+  return true;
+}
+
+// Generate 30-min burst fire-times from `startMs`, 48h window, skipping quiet-hours slots.
+function superBurstTimes(startMs, quietHours) {
+  const times = [];
+  const INTERVAL = 30 * 60 * 1000;
+  const WINDOW = 48 * 60 * 60 * 1000;
+  const HARD_CAP = 70; // safety vs Android's per-app pending-notification limit
+  let t = startMs;
+  const end = startMs + WINDOW;
+  while (t <= end && times.length < HARD_CAP) {
+    const shifted = shiftIntoWakingHours(new Date(t), quietHours);
+    // shiftIntoWakingHours returns the same date if outside quiet hours; if it moved it, the slot
+    // was inside quiet hours → skip it entirely (don't stack everything onto wake-up time)
+    if (shifted.getTime() === t && t > Date.now()) times.push(t);
+    t += INTERVAL;
+  }
+  return times;
+}
+
 const Notif = {
   isCapacitor: () => typeof window !== "undefined" && !!window.Capacitor?.isNativePlatform?.(),
   _actionsRegistered: false,
@@ -1011,12 +1045,26 @@ const Notif = {
           { id: "task", actions: [
             { id: "done", title: "Erledigt ✓" },
             { id: "snooze15", title: "+15 Min" },
+            { id: "superon", title: "Penetrier mich!" },
+          ] },
+          { id: "task_super", actions: [
+            { id: "done", title: "✓ Erledigt" },
+          ] },
+          { id: "event", actions: [
+            { id: "superon", title: "Penetrier mich!" },
+          ] },
+          { id: "event_super", actions: [
+            { id: "done", title: "✓ Erledigt" },
           ] },
           { id: "habit", actions: [
             { id: "done", title: "Erledigt ✓" },
           ] },
           { id: "birthday", actions: [
             { id: "wish", title: "Glückwunsch" },
+            { id: "superon", title: "Penetrier mich!" },
+          ] },
+          { id: "birthday_super", actions: [
+            { id: "done", title: "✓ Erledigt" },
           ] },
         ],
       });
@@ -1096,8 +1144,9 @@ function hashCode(s) { let h = 0; for (let i = 0; i < s.length; i++) { h = ((h <
 function buildDigestBody(state, dateStr) {
   const dt = new Date(dateStr + "T12:00:00");
   const weekday = (dt.getDay() + 6) % 7;
-  const tasks = state.tasks.filter(t => getTaskDates(t, dateStr, dateStr).includes(dateStr) && t.status !== "done");
-  const events = state.events.filter(e => getEventDates(e, dateStr, dateStr).includes(dateStr) && !e.isHoliday);
+  // Super-Penetrations items are excluded — they nag every 30 min already, no need in the digest.
+  const tasks = state.tasks.filter(t => getTaskDates(t, dateStr, dateStr).includes(dateStr) && t.status !== "done" && !isSuperTask(t));
+  const events = state.events.filter(e => getEventDates(e, dateStr, dateStr).includes(dateStr) && !e.isHoliday && !isSuperEvent(e, state.settings, e.startDate));
   const holidays = state.events.filter(e => getEventDates(e, dateStr, dateStr).includes(dateStr) && e.isHoliday && e.holidayKind === "legal");
   const workouts = state.workouts.filter(w => w.weekday === weekday);
   const habits = (state.habits || []).filter(h => {
@@ -1153,10 +1202,12 @@ function buildMorningNudge(state, dateStr) {
   const untimedTasks = state.tasks.filter(t => {
     if (t.status === "done") return false;
     if (t.startTime) return false;
+    if (isSuperTask(t)) return false; // super items nag separately
     return getTaskDates(t, dateStr, dateStr).includes(dateStr);
   });
   const todayBirthdays = state.events.filter(e =>
     e.type === "birthday" && !e.isHoliday && getEventDates(e, dateStr, dateStr).includes(dateStr)
+    && !isSuperEvent(e, state.settings, e.startDate)
   );
   const total = habits.length + untimedTasks.length + todayBirthdays.length;
   if (total === 0) return null;
@@ -1502,13 +1553,27 @@ function useNotifications(state) {
           if (!t.startDate || !t.startTime || !t.reminderMinutes || t.status === "done") return;
           const dueMs = new Date(`${t.startDate}T${t.startTime}:00`).getTime();
           const subInfo = (t.subtasks || []).length ? ` · ${(t.subtasks || []).filter(s => !s.done).length}/${(t.subtasks || []).length} Subtasks offen` : "";
-          safeSchedule(`task-${t.id}-${dueMs}`, dueMs - t.reminderMinutes * 60000, {
-            channelKey: "tasks",
-            title: `⚡ ${t.title}`,
-            body: `Beginnt um ${t.startTime} Uhr${subInfo}`,
-            actionTypeId: "task",
-            extra: { taskId: t.id, kind: "task" },
-          });
+          if (isSuperTask(t)) {
+            // Super-Penetrations-Modus: 30-min burst from reminder time, 48h cap, skip quiet hours
+            const burstStart = dueMs - t.reminderMinutes * 60000;
+            superBurstTimes(burstStart, quietHours).forEach((ts, idx) => {
+              safeSchedule(`super-task-${t.id}-${idx}`, ts, {
+                channelKey: "tasks",
+                title: `🔥 ${t.title}`,
+                body: `MACH ES JETZT. ${t.startTime ? "Geplant " + t.startTime + " Uhr." : ""}${subInfo}`,
+                actionTypeId: "task_super",
+                extra: { taskId: t.id, kind: "task" },
+              });
+            });
+          } else {
+            safeSchedule(`task-${t.id}-${dueMs}`, dueMs - t.reminderMinutes * 60000, {
+              channelKey: "tasks",
+              title: `⚡ ${t.title}`,
+              body: `Beginnt um ${t.startTime} Uhr${subInfo}`,
+              actionTypeId: "task",
+              extra: { taskId: t.id, kind: "task" },
+            });
+          }
         });
       }
       // Events / Birthdays / Vacation
@@ -1519,19 +1584,33 @@ function useNotifications(state) {
         if (!isBday && !settings.notifEvents) return;
         const time = e.startTime || "09:00";
         const dueMs = new Date(`${e.startDate}T${time}:00`).getTime();
+        const occurrenceDate = e.startDate;
         const icon = isBday ? "🎂" : e.type === "vacation" ? "✈️" : "📅";
         let body = e.notes || "Erinnerung";
         if (isBday && e.birthYear) {
           const age = new Date(e.startDate + "T12:00:00").getFullYear() - e.birthYear;
           body = `Wird ${age}${e.notes ? " · " + e.notes : ""}`;
         }
-        safeSchedule(`event-${e.id}-${dueMs}`, dueMs - e.reminderMinutes * 60000, {
-          channelKey: isBday ? "birthdays" : "events",
-          title: `${icon} ${e.title}`,
-          body,
-          actionTypeId: isBday ? "birthday" : undefined,
-          extra: { eventId: e.id, kind: isBday ? "birthday" : "event" },
-        });
+        if (isSuperEvent(e, settings, occurrenceDate)) {
+          const burstStart = dueMs - e.reminderMinutes * 60000;
+          superBurstTimes(burstStart, quietHours).forEach((ts, idx) => {
+            safeSchedule(`super-event-${e.id}-${idx}`, ts, {
+              channelKey: isBday ? "birthdays" : "events",
+              title: `🔥 ${e.title}`,
+              body: `NICHT VERGESSEN! ${body}`,
+              actionTypeId: isBday ? "birthday_super" : "event_super",
+              extra: { eventId: e.id, kind: isBday ? "birthday" : "event", occ: occurrenceDate },
+            });
+          });
+        } else {
+          safeSchedule(`event-${e.id}-${dueMs}`, dueMs - e.reminderMinutes * 60000, {
+            channelKey: isBday ? "birthdays" : "events",
+            title: `${icon} ${e.title}`,
+            body,
+            actionTypeId: isBday ? "birthday" : "event",
+            extra: { eventId: e.id, kind: isBday ? "birthday" : "event", occ: occurrenceDate },
+          });
+        }
       });
       // Workouts (next 7 days)
       if (settings.notifWorkouts) {
@@ -1771,6 +1850,7 @@ function AddTaskModal({ onClose, onAdd, projects, settings }) {
   const [reminderMinutes, setReminderMinutes] = useState(settings?.defaultTaskReminder ?? 30);
   const [projectId, setProjectId] = useState("");
   const [isFrog, setIsFrog] = useState(false);
+  const [superMode, setSuperMode] = useState(false);
   const [recType, setRecType] = useState("none");
   const [recWeekdays, setRecWeekdays] = useState([]);
   const voice = useVoiceInput((text) => setTitle(prev => (prev ? prev + " " : "") + text));
@@ -1784,7 +1864,7 @@ function AddTaskModal({ onClose, onAdd, projects, settings }) {
       startDate, endDate: endDate || startDate,
       startTime: allDay ? "" : startTime, endTime: allDay ? "" : endTime, allDay,
       subtasks: [], tags: [], projectId: projectId || null,
-      estimatedMinutes: 0, actualMinutes: 0, energy, isFrog,
+      estimatedMinutes: 0, actualMinutes: 0, energy, isFrog, superMode,
       reminderMinutes: Number(reminderMinutes), recurrence, createdAt: Date.now(),
     });
     onClose();
@@ -1881,6 +1961,16 @@ function AddTaskModal({ onClose, onAdd, projects, settings }) {
               <span className={`chk ${isFrog ? "on" : ""}`}>{isFrog && <Check size={12} color="#000" strokeWidth={3} />}</span>
             </div>
           </div>
+          <div className="card-sm" onClick={() => setSuperMode(!superMode)} style={{ cursor: "pointer", borderColor: superMode ? "#FF3B3B" : "var(--border)" }}>
+            <div className="row" style={{ justifyContent: "space-between" }}>
+              <div className="row">
+                <span style={{ fontSize: 18 }}>🔥</span>
+                <div><div style={{ fontSize: 13, fontWeight: 600 }}>Super-Penetrations-Modus</div>
+                <div style={{ fontSize: 11, color: "var(--muted)" }}>Alle 30 Min Push bis du bestätigst</div></div>
+              </div>
+              <span className={`chk ${superMode ? "on" : ""}`} style={superMode ? { background: "#FF3B3B", borderColor: "#FF3B3B" } : {}}>{superMode && <Check size={12} color="#fff" strokeWidth={3} />}</span>
+            </div>
+          </div>
           <button className="btn btn-primary" onClick={submit} style={{ width: "100%", padding: 14, fontSize: 15, marginTop: 4 }}>⚡ ERSTELLEN</button>
         </div>
       </div>
@@ -1901,6 +1991,7 @@ function AddEventModal({ onClose, onAdd, defaultDate, defaultType, settings }) {
   const [reminderMinutes, setReminderMinutes] = useState(reminderDefault);
   const [yearly, setYearly] = useState(false);
   const [birthYear, setBirthYear] = useState("");
+  const [superMode, setSuperMode] = useState(false);
 
   const submit = () => {
     if (!title.trim()) return;
@@ -1912,7 +2003,7 @@ function AddEventModal({ onClose, onAdd, defaultDate, defaultType, settings }) {
       allDay, startTime: allDay ? "" : startTime, endTime: allDay ? "" : endTime,
       notes: notes.trim(), color: t.color, reminderMinutes: Number(reminderMinutes),
       recurrence: (yearly || isBday) ? { type: "yearly" } : null,
-      isHoliday: false, createdAt: Date.now(),
+      isHoliday: false, createdAt: Date.now(), superMode,
       ...(isBday ? { birthYear: birthYear ? Number(birthYear) : null, gifts: [], giftReminderWeeks: null } : {}),
     });
     onClose();
@@ -1973,6 +2064,16 @@ function AddEventModal({ onClose, onAdd, defaultDate, defaultType, settings }) {
               <input className="input" type="number" placeholder="z.B. 1990" value={birthYear} onChange={e => setBirthYear(e.target.value)} min="1900" max={new Date().getFullYear()} />
             </div>
           )}
+          <div className="card-sm" onClick={() => setSuperMode(!superMode)} style={{ cursor: "pointer", borderColor: superMode ? "#FF3B3B" : "var(--border)" }}>
+            <div className="row" style={{ justifyContent: "space-between" }}>
+              <div className="row">
+                <span style={{ fontSize: 18 }}>🔥</span>
+                <div><div style={{ fontSize: 13, fontWeight: 600 }}>Super-Penetrations-Modus</div>
+                <div style={{ fontSize: 11, color: "var(--muted)" }}>Alle 30 Min Push bis du bestätigst</div></div>
+              </div>
+              <span className={`chk ${superMode ? "on" : ""}`} style={superMode ? { background: "#FF3B3B", borderColor: "#FF3B3B" } : {}}>{superMode && <Check size={12} color="#fff" strokeWidth={3} />}</span>
+            </div>
+          </div>
           <button className="btn btn-primary" onClick={submit} style={{ width: "100%", padding: 14, fontSize: 15 }}>⚡ TERMIN ERSTELLEN</button>
         </div>
       </div>
@@ -2138,6 +2239,16 @@ function TaskDetailModal({ task, onClose, dispatch, projects, openPomo }) {
                 <input className="input" type="time" value={draft.endTime} onChange={e => setDraft({ ...draft, endTime: e.target.value })} />
               </div>
             )}
+            <div className="card-sm" onClick={() => setDraft({ ...draft, superMode: !draft.superMode })} style={{ cursor: "pointer", borderColor: draft.superMode ? "#FF3B3B" : "var(--border)" }}>
+              <div className="row" style={{ justifyContent: "space-between" }}>
+                <div className="row">
+                  <span style={{ fontSize: 18 }}>🔥</span>
+                  <div><div style={{ fontSize: 13, fontWeight: 600 }}>Super-Penetrations-Modus</div>
+                  <div style={{ fontSize: 11, color: "var(--muted)" }}>Alle 30 Min Push bis du bestätigst</div></div>
+                </div>
+                <span className={`chk ${draft.superMode ? "on" : ""}`} style={draft.superMode ? { background: "#FF3B3B", borderColor: "#FF3B3B" } : {}}>{draft.superMode && <Check size={12} color="#fff" strokeWidth={3} />}</span>
+              </div>
+            </div>
             <div className="row" style={{ gap: 8 }}>
               <button className="btn btn-ghost" onClick={() => setEditing(false)} style={{ flex: 1 }}>Abbrechen</button>
               <button className="btn btn-primary" onClick={save} style={{ flex: 1 }}>Speichern</button>
@@ -2155,6 +2266,7 @@ function TaskDetailModal({ task, onClose, dispatch, projects, openPomo }) {
           <div className="row" style={{ gap: 6 }}>
             <span className="tag" style={{ background: catOf(task.category).color + "22", color: catOf(task.category).color }}>{catOf(task.category).icon} {catOf(task.category).label}</span>
             <span className="tag" style={{ background: prioOf(task.priority).color + "22", color: prioOf(task.priority).color }}>{prioOf(task.priority).label}</span>
+            {task.superMode && <span className="tag" style={{ background: "#FF3B3B22", color: "#FF3B3B" }}>🔥 Penetranz</span>}
           </div>
           <button className="btn btn-ghost btn-icon" onClick={onClose}><X size={18} /></button>
         </div>
@@ -2312,6 +2424,16 @@ function EventDetailModal({ event, onClose, dispatch }) {
                 </div>
               </>
             )}
+            <div className="card-sm" onClick={() => setDraft({ ...draft, superMode: !draft.superMode })} style={{ cursor: "pointer", borderColor: draft.superMode ? "#FF3B3B" : "var(--border)" }}>
+              <div className="row" style={{ justifyContent: "space-between" }}>
+                <div className="row">
+                  <span style={{ fontSize: 18 }}>🔥</span>
+                  <div><div style={{ fontSize: 13, fontWeight: 600 }}>Super-Penetrations-Modus</div>
+                  <div style={{ fontSize: 11, color: "var(--muted)" }}>Alle 30 Min Push bis du bestätigst</div></div>
+                </div>
+                <span className={`chk ${draft.superMode ? "on" : ""}`} style={draft.superMode ? { background: "#FF3B3B", borderColor: "#FF3B3B" } : {}}>{draft.superMode && <Check size={12} color="#fff" strokeWidth={3} />}</span>
+              </div>
+            </div>
             <div className="row" style={{ gap: 8, marginTop: 4 }}>
               <button className="btn btn-ghost" onClick={() => { setDraft(event); setEditing(false); }} style={{ flex: 1 }}>Abbrechen</button>
               <button className="btn btn-primary" onClick={save} style={{ flex: 2 }}>💾 Speichern</button>
@@ -3302,6 +3424,24 @@ function SettingsModal({ state, dispatch, onClose }) {
                   </select>
                 </div>
               ))}
+            </div>
+          )}
+
+          {/* Super-Penetrations-Modus für alle Geburtstage */}
+          {state.settings.notifications && (
+            <div className="card-sm" onClick={() => dispatch({ type: "UPD_SETTINGS", payload: { superModeAllBirthdays: !state.settings.superModeAllBirthdays } })} style={{ cursor: "pointer", borderColor: state.settings.superModeAllBirthdays ? "#FF3B3B" : "var(--border)" }}>
+              <div className="between">
+                <div className="row">
+                  <span style={{ fontSize: 18 }}>🔥</span>
+                  <div>
+                    <div style={{ fontWeight: 600, fontSize: 14 }}>Super-Penetrations-Modus für ALLE Geburtstage</div>
+                    <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 2 }}>
+                      {state.settings.superModeAllBirthdays ? "Jeder Geburtstag nervt alle 30 Min bis bestätigt" : "Aus — nur einzeln pro Geburtstag aktivierbar"}
+                    </div>
+                  </div>
+                </div>
+                <span className={`chk ${state.settings.superModeAllBirthdays ? "on" : ""}`} style={state.settings.superModeAllBirthdays ? { background: "#FF3B3B", borderColor: "#FF3B3B" } : {}}>{state.settings.superModeAllBirthdays && <Check size={12} color="#fff" strokeWidth={3} />}</span>
+              </div>
             </div>
           )}
 
@@ -6383,11 +6523,25 @@ function AppInner() {
     let listener;
     LocalNotifications.addListener("localNotificationActionPerformed", ({ actionId, notification }) => {
       const extra = notification?.extra || {};
+      const cancelSuperBurst = async (prefix) => {
+        // Wipe the remaining burst notifications immediately (don't wait for the next sync)
+        try {
+          const pending = await LocalNotifications.getPending();
+          const toCancel = pending.notifications.filter(n => {
+            const ex = n.extra || {};
+            return prefix === "task" ? ex.taskId === extra.taskId && ex.kind === "task"
+              : ex.eventId === extra.eventId && (ex.kind === "event" || ex.kind === "birthday");
+          });
+          if (toCancel.length) await LocalNotifications.cancel({ notifications: toCancel.map(n => ({ id: n.id })) });
+        } catch {}
+      };
       if (extra.kind === "task" && extra.taskId) {
         if (actionId === "done") {
           dispatch({ type: "MOVE_TASK", payload: { id: extra.taskId, status: "done" } });
+          cancelSuperBurst("task");
+        } else if (actionId === "superon") {
+          dispatch({ type: "UPD_TASK", payload: { id: extra.taskId, superMode: true } });
         } else if (actionId === "snooze15") {
-          // Re-fire same notification 15 minutes from now
           const t = state.tasks.find(x => x.id === extra.taskId);
           if (t) {
             Notif.schedule({
@@ -6407,13 +6561,18 @@ function AppInner() {
         if (actionId === "done") {
           dispatch({ type: "TOGGLE_HABIT", payload: { id: extra.habitId, date: localDate() } });
         }
-      } else if (extra.kind === "birthday" && extra.eventId) {
+      } else if ((extra.kind === "birthday" || extra.kind === "event") && extra.eventId) {
         if (actionId === "wish") {
-          // Open share sheet on Capacitor; on web fall back to navigator.share
           const e = state.events.find(x => x.id === extra.eventId);
           if (e && navigator.share) {
             navigator.share({ title: "Geburtstagsgruß", text: `Alles Gute zum Geburtstag, ${(e.title || "").replace(/[\s']+Geburtstag\s*$/i, "")}! 🎂` }).catch(() => {});
           }
+        } else if (actionId === "superon") {
+          dispatch({ type: "UPD_EVENT", payload: { id: extra.eventId, superMode: true } });
+        } else if (actionId === "done") {
+          // Ack the Super-Penetrations nag for this occurrence (events have no "done" status)
+          dispatch({ type: "UPD_EVENT", payload: { id: extra.eventId, superAckDate: extra.occ || localDate() } });
+          cancelSuperBurst("event");
         } else if (actionId === "tap") {
           setOpenEventId(extra.eventId);
         }
