@@ -237,10 +237,10 @@ html, body, #root { height: 100%; background: #000; color: var(--text); overflow
 // ════════════════════════════════════════════════════════════════════════════
 // SCHEMA & MIGRATIONS
 // ════════════════════════════════════════════════════════════════════════════
-const SCHEMA_VERSION = 12;
+const SCHEMA_VERSION = 13;
 // One-line "what changed" shown once after an update (post-reload changelog toast).
 // Bump together with package.json version on every release.
-const RELEASE_NOTE = "Offline-Modus: App läuft jetzt ohne Netz · Fonts self-hosted · Update-Hinweise";
+const RELEASE_NOTE = "Gratitude-Upgrade: Kategorien, Prompts, Wochen-Recap, Throwback · Backup-Historie (7 Tage)";
 const STORAGE_KEY = "gsd-data";
 
 // localStorage wrapper that mimics Claude's window.storage API
@@ -392,6 +392,14 @@ const migrations = {
       ...(d.settings || {}),
       calendarFilters: { tasks: true, events: true, vacation: true, birthdays: true, holidays: true, habits: true, sport: true, muell: false, ...((d.settings || {}).calendarFilters || {}) },
     },
+  }),
+  13: (d) => ({
+    ...d, version: 13,
+    // Gratitude items: plain strings → { text, cat? } objects (cat optional, added in UI)
+    gratitude: (d.gratitude || []).map(g => ({
+      ...g,
+      items: (g.items || []).map(it => (typeof it === "string" ? { text: it } : it)),
+    })),
   }),
 };
 
@@ -3392,6 +3400,33 @@ function SettingsModal({ state, dispatch, onClose }) {
     (state.events || []).forEach(e => { if (e.icalSource) s[e.icalSource] = (s[e.icalSource] || 0) + 1; });
     return Object.entries(s);
   }, [state.events]);
+  // Auto-backup history (Documents/gsd-autobackup-DATE.json) — list + restore.
+  const [autoBackups, setAutoBackups] = useState([]);
+  useEffect(() => {
+    const isCap = typeof window !== "undefined" && !!window.Capacitor?.isNativePlatform?.();
+    if (!isCap) return;
+    (async () => {
+      try {
+        const dir = await Filesystem.readdir({ path: "", directory: Directory.Documents });
+        const list = (dir.files || [])
+          .map(f => (typeof f === "string" ? f : f.name))
+          .filter(n => /^gsd-autobackup-\d{4}-\d{2}-\d{2}\.json$/.test(n))
+          .sort().reverse();
+        setAutoBackups(list);
+      } catch { setAutoBackups([]); }
+    })();
+  }, []);
+  const restoreAutoBackup = async (name) => {
+    try {
+      const res = await Filesystem.readFile({ path: name, directory: Directory.Documents, encoding: Encoding.UTF8 });
+      const parsed = JSON.parse(res.data);
+      const migrated = migrate(parsed);
+      if (confirm(`Daten aus "${name}" wiederherstellen?\nAktuelle Daten werden überschrieben.`)) {
+        dispatch({ type: "LOAD", payload: { ...migrated, view: state.view } });
+        alert("✓ Wiederhergestellt aus " + name);
+      }
+    } catch (e) { alert("Wiederherstellen fehlgeschlagen: " + (e?.message || "unbekannt")); }
+  };
   const doWipe = () => {
     dispatch({ type: "WIPE_USER_DATA" });
     setWipeStep(0);
@@ -3688,6 +3723,23 @@ function SettingsModal({ state, dispatch, onClose }) {
             <Upload size={14} /> Backup importieren
             <input type="file" accept=".json" onChange={e => e.target.files[0] && importData(e.target.files[0])} style={{ display: "none" }} />
           </label>
+          {autoBackups.length > 0 && (
+            <div className="card-sm">
+              <div className="stat-label" style={{ marginBottom: 6 }}>Auto-Backups (letzte 7 Tage)</div>
+              {autoBackups.map(name => {
+                const d = name.replace("gsd-autobackup-", "").replace(".json", "");
+                return (
+                  <div key={name} className="between" style={{ padding: "4px 0" }}>
+                    <span className="mono" style={{ fontSize: 12 }}>{new Date(d + "T12:00:00").toLocaleDateString("de-DE", { weekday: "short", day: "numeric", month: "short" })}</span>
+                    <button className="btn btn-ghost" style={{ padding: "3px 10px", fontSize: 10, color: "var(--lime)" }}
+                      onClick={() => restoreAutoBackup(name)}>
+                      Wiederherstellen
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+          )}
 
           {/* iCal / Kalender-Import */}
           <div className="section-title">📅 Kalender-Import (.ics)</div>
@@ -5495,22 +5547,48 @@ function AchievementsSub({ state, onBack }) {
   );
 }
 
+const GRATITUDE_CATS = [
+  { id: "mensch", emoji: "👤", label: "Mensch" },
+  { id: "moment", emoji: "🌅", label: "Moment" },
+  { id: "ding", emoji: "🎁", label: "Ding" },
+  { id: "ueberraschung", emoji: "✨", label: "Überraschung" },
+  { id: "sinn", emoji: "🧘", label: "Sinn" },
+];
+const GRATITUDE_PROMPTS = [
+  "Wer hat dich heute zum Lächeln gebracht?",
+  "Was hat dich heute überrascht?",
+  "Welcher kleine Moment war schön?",
+  "Wofür wärst du vor 5 Jahren nicht dankbar gewesen?",
+  "Was hat heute besser geklappt als gedacht?",
+  "Wer hat dir heute geholfen?",
+  "Was hast du heute gesehen/gehört/geschmeckt das gut war?",
+  "Worauf freust du dich gerade?",
+  "Was an deinem Körper/deiner Gesundheit ist heute gut gelaufen?",
+  "Welche Sache nimmst du sonst als selbstverständlich?",
+];
+const gItemText = (it) => (typeof it === "string" ? it : (it?.text || ""));
+const gItemCat = (it) => (typeof it === "string" ? null : (it?.cat || null));
+
 function GratitudeSub({ state, dispatch, onBack }) {
   const today = localDate();
   const [inputs, setInputs] = useState(["", "", ""]);
+  const [cats, setCats] = useState([null, null, null]);
   const [tagInput, setTagInput] = useState("");
   const [tags, setTags] = useState([]);
   const list = (state.gratitude || []).slice().sort((a, b) => (b.date || "").localeCompare(a.date || ""));
   const todayEntry = list.find(g => g.date === today);
   useEffect(() => {
     if (todayEntry) {
-      setInputs(todayEntry.items.concat(["", "", ""]).slice(0, 3));
+      const its = (todayEntry.items || []).concat([{}, {}, {}]).slice(0, 3);
+      setInputs(its.map(it => gItemText(it)));
+      setCats(its.map(it => gItemCat(it)));
       setTags(todayEntry.tags || []);
     }
   }, [todayEntry?.id]);
 
   const save = () => {
-    const items = inputs.map(s => s.trim()).filter(Boolean);
+    const items = inputs.map((s, i) => ({ text: s.trim(), cat: cats[i] || undefined }))
+      .filter(it => it.text);
     if (items.length === 0) return;
     dispatch({ type: "ADD_GRATITUDE", payload: { date: today, items, tags } });
     fireCelebration();
@@ -5518,15 +5596,62 @@ function GratitudeSub({ state, dispatch, onBack }) {
 
   const streak = useMemo(() => longestGratitudeStreak(state), [state.gratitude]);
 
-  // Throwback — random entry from > 30 days ago
+  // Prompts rotate by day so the placeholders aren't always the same.
+  const promptFor = (i) => {
+    const dayIdx = Math.floor(new Date(today + "T12:00:00").getTime() / 86400000);
+    return GRATITUDE_PROMPTS[(dayIdx + i * 3) % GRATITUDE_PROMPTS.length];
+  };
+
+  // Throwback — prefer "heute vor einem Jahr" (±3d), else "vor 30 Tagen" (±3d), else random old.
   const throwback = useMemo(() => {
-    const old = list.filter(g => {
-      const days = (new Date(today + "T12:00:00") - new Date(g.date + "T12:00:00")) / 86400000;
-      return days >= 30;
-    });
-    if (old.length === 0) return null;
-    return old[Math.floor(Math.random() * old.length)];
+    const others = list.filter(g => g.date !== today);
+    const dayMs = 86400000;
+    const nowMs = new Date(today + "T12:00:00").getTime();
+    const near = (targetDays, tol) => {
+      const cands = others.filter(g => {
+        const d = (nowMs - new Date(g.date + "T12:00:00").getTime()) / dayMs;
+        return Math.abs(d - targetDays) <= tol;
+      });
+      return cands.length ? { entry: cands[Math.floor(Math.random() * cands.length)], label: targetDays >= 360 ? "Heute vor einem Jahr" : "Vor etwa einem Monat" } : null;
+    };
+    const yr = near(365, 4);
+    if (yr) return yr;
+    const mo = near(30, 4);
+    if (mo) return mo;
+    const old = others.filter(g => (nowMs - new Date(g.date + "T12:00:00").getTime()) / dayMs >= 30);
+    if (!old.length) return null;
+    return { entry: old[Math.floor(Math.random() * old.length)], label: "Vor einer Weile" };
   }, [list.length, today]);
+
+  // Category distribution across all items.
+  const dist = useMemo(() => {
+    const m = {};
+    (state.gratitude || []).forEach(g => (g.items || []).forEach(it => {
+      const c = gItemCat(it);
+      if (c) m[c] = (m[c] || 0) + 1;
+    }));
+    return m;
+  }, [state.gratitude]);
+  const distTotal = Object.values(dist).reduce((a, b) => a + b, 0);
+
+  // Weekly recap — entries from the last 7 days.
+  const recap = useMemo(() => {
+    const nowMs = new Date(today + "T12:00:00").getTime();
+    const week = list.filter(g => (nowMs - new Date(g.date + "T12:00:00").getTime()) / 86400000 < 7);
+    if (week.length === 0) return null;
+    const catCount = {};
+    let itemTotal = 0;
+    week.forEach(g => (g.items || []).forEach(it => {
+      itemTotal++;
+      const c = gItemCat(it);
+      if (c) catCount[c] = (catCount[c] || 0) + 1;
+    }));
+    const topCat = Object.entries(catCount).sort((a, b) => b[1] - a[1])[0];
+    const topCatDef = topCat ? GRATITUDE_CATS.find(c => c.id === topCat[0]) : null;
+    const allItems = week.flatMap(g => (g.items || []));
+    const highlight = allItems.length ? gItemText(allItems[Math.floor(Math.random() * allItems.length)]) : null;
+    return { days: week.length, itemTotal, topCatDef, highlight };
+  }, [list, today]);
 
   return (
     <div className="view">
@@ -5547,19 +5672,53 @@ function GratitudeSub({ state, dispatch, onBack }) {
         </div>
       </div>
 
+      {/* Weekly recap */}
+      {recap && (
+        <div className="card" style={{ marginBottom: 14, borderLeft: "3px solid var(--lime)" }}>
+          <div className="stat-label" style={{ marginBottom: 6 }}>📊 Diese Woche</div>
+          <div style={{ fontSize: 13 }}>
+            {recap.days} {recap.days === 1 ? "Tag" : "Tage"} · {recap.itemTotal} Einträge
+            {recap.topCatDef && <> · meist {recap.topCatDef.emoji} {recap.topCatDef.label}</>}
+          </div>
+          {recap.highlight && (
+            <div style={{ fontSize: 13, marginTop: 8, color: "var(--muted)", fontStyle: "italic" }}>
+              „{recap.highlight}"
+            </div>
+          )}
+        </div>
+      )}
+
       {/* Today's input */}
       <div className="card" style={{ marginBottom: 14, borderLeft: "3px solid #FFB800" }}>
         <div className="stat-label" style={{ marginBottom: 8 }}>Heute · {todayEntry ? "✓ schon eingetragen" : "3 Dinge"}</div>
-        <div className="col" style={{ gap: 6 }}>
+        <div className="col" style={{ gap: 10 }}>
           {[0, 1, 2].map(i => (
-            <input
-              key={i}
-              className="input"
-              placeholder={`${i + 1}. Ich bin dankbar für…`}
-              value={inputs[i]}
-              onChange={e => { const n = [...inputs]; n[i] = e.target.value; setInputs(n); }}
-              style={{ fontSize: 14 }}
-            />
+            <div key={i}>
+              <input
+                className="input"
+                placeholder={promptFor(i)}
+                value={inputs[i]}
+                onChange={e => { const n = [...inputs]; n[i] = e.target.value; setInputs(n); }}
+                style={{ fontSize: 14 }}
+              />
+              <div className="row" style={{ gap: 4, marginTop: 5, flexWrap: "wrap" }}>
+                {GRATITUDE_CATS.map(c => (
+                  <button
+                    key={c.id}
+                    onClick={() => { const n = [...cats]; n[i] = n[i] === c.id ? null : c.id; setCats(n); }}
+                    className="chip"
+                    style={{
+                      padding: "3px 8px", fontSize: 11,
+                      background: cats[i] === c.id ? "var(--lime-soft)" : "var(--s2)",
+                      color: cats[i] === c.id ? "var(--lime)" : "var(--muted)",
+                      border: cats[i] === c.id ? "1px solid var(--lime)" : "1px solid var(--border)",
+                    }}
+                  >
+                    {c.emoji} {c.label}
+                  </button>
+                ))}
+              </div>
+            </div>
           ))}
           <div className="row" style={{ gap: 6, marginTop: 4, flexWrap: "wrap" }}>
             {tags.map((t, i) => (
@@ -5588,15 +5747,36 @@ function GratitudeSub({ state, dispatch, onBack }) {
         </div>
       </div>
 
+      {/* Category distribution */}
+      {distTotal > 0 && (
+        <div className="card-sm" style={{ marginBottom: 14 }}>
+          <div className="stat-label" style={{ marginBottom: 8 }}>Verteilung</div>
+          <div className="row" style={{ gap: 10, flexWrap: "wrap" }}>
+            {GRATITUDE_CATS.map(c => {
+              const n = dist[c.id] || 0;
+              const pct = Math.round((n / distTotal) * 100);
+              return (
+                <div key={c.id} style={{ fontSize: 12, color: n ? "var(--text)" : "var(--dim)" }}>
+                  {c.emoji} {n}<span style={{ color: "var(--muted)", fontSize: 10 }}> · {pct}%</span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
       {/* Throwback */}
       {throwback && (
         <div className="card" style={{ marginBottom: 14, borderLeft: "3px solid #FF2D78" }}>
-          <div className="stat-label" style={{ marginBottom: 6 }}>✨ Vor einer Weile dankbar für</div>
+          <div className="stat-label" style={{ marginBottom: 6 }}>✨ {throwback.label} dankbar für</div>
           <div style={{ fontSize: 11, color: "var(--muted)", marginBottom: 6 }}>
-            {new Date(throwback.date + "T12:00:00").toLocaleDateString("de-DE", { day: "numeric", month: "long", year: "numeric" })}
+            {new Date(throwback.entry.date + "T12:00:00").toLocaleDateString("de-DE", { day: "numeric", month: "long", year: "numeric" })}
           </div>
-          {throwback.items.map((it, i) => (
-            <div key={i} style={{ fontSize: 13, marginTop: 4 }}>{i + 1}. {it}</div>
+          {(throwback.entry.items || []).map((it, i) => (
+            <div key={i} style={{ fontSize: 13, marginTop: 4 }}>
+              {gItemCat(it) && <span style={{ marginRight: 4 }}>{GRATITUDE_CATS.find(c => c.id === gItemCat(it))?.emoji}</span>}
+              {gItemText(it)}
+            </div>
           ))}
         </div>
       )}
@@ -5615,7 +5795,12 @@ function GratitudeSub({ state, dispatch, onBack }) {
                 </div>
                 <button onClick={() => { if (confirm("Eintrag löschen?")) dispatch({ type: "DEL_GRATITUDE", payload: g.id }); }} className="btn btn-ghost btn-icon" style={{ width: 22, height: 22 }}><X size={11} /></button>
               </div>
-              {g.items.map((it, i) => <div key={i} style={{ fontSize: 13, marginTop: 2 }}>{i + 1}. {it}</div>)}
+              {(g.items || []).map((it, i) => (
+                <div key={i} style={{ fontSize: 13, marginTop: 2 }}>
+                  {gItemCat(it) && <span style={{ marginRight: 4 }}>{GRATITUDE_CATS.find(c => c.id === gItemCat(it))?.emoji}</span>}
+                  {gItemText(it)}
+                </div>
+              ))}
               {g.tags && g.tags.length > 0 && (
                 <div className="row" style={{ marginTop: 6, gap: 4, flexWrap: "wrap" }}>
                   {g.tags.map((t, i) => <span key={i} className="tag" style={{ background: "var(--s2)", color: "var(--muted)", fontSize: 9 }}>#{t}</span>)}
@@ -6988,7 +7173,7 @@ function AppInner() {
     })();
   }, [state, loaded]);
 
-  // AUTO-BACKUP — once per day, write a rolling JSON snapshot to the Documents folder.
+  // AUTO-BACKUP — once per day, dated snapshot to Documents, keep the last 7, prune older.
   // Pure local safety net (works offline); no share-sheet, no user action.
   useEffect(() => {
     if (!loaded) return;
@@ -7001,13 +7186,25 @@ function AppInner() {
         if (last === today) return; // already backed up today
         const { view, ...persist } = state;
         await Filesystem.writeFile({
-          path: "gsd-autobackup.json",
+          path: `gsd-autobackup-${today}.json`,
           data: JSON.stringify(persist),
           directory: Directory.Documents,
           encoding: Encoding.UTF8,
           recursive: true,
         });
         localStorage.setItem("gsd-last-autobackup", today);
+        // Prune: keep the 7 most recent dated auto-backups
+        try {
+          const dir = await Filesystem.readdir({ path: "", directory: Directory.Documents });
+          const backups = (dir.files || [])
+            .map(f => (typeof f === "string" ? f : f.name))
+            .filter(n => /^gsd-autobackup-\d{4}-\d{2}-\d{2}\.json$/.test(n))
+            .sort();
+          const stale = backups.slice(0, Math.max(0, backups.length - 7));
+          for (const name of stale) {
+            try { await Filesystem.deleteFile({ path: name, directory: Directory.Documents }); } catch {}
+          }
+        } catch {}
       } catch (e) { console.warn("auto-backup failed", e); }
     })();
   }, [loaded, state]);
