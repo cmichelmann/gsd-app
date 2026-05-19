@@ -21,7 +21,9 @@ import {
 // CSS
 // ════════════════════════════════════════════════════════════════════════════
 const CSS = `
-@import url('https://fonts.googleapis.com/css2?family=Anton&family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap');
+@font-face{font-family:'Anton';font-style:normal;font-weight:400;font-display:swap;src:url(${import.meta.env.BASE_URL}fonts/anton.woff2) format('woff2');}
+@font-face{font-family:'Inter';font-style:normal;font-weight:100 900;font-display:swap;src:url(${import.meta.env.BASE_URL}fonts/inter.woff2) format('woff2');}
+@font-face{font-family:'JetBrains Mono';font-style:normal;font-weight:100 800;font-display:swap;src:url(${import.meta.env.BASE_URL}fonts/jetbrainsmono.woff2) format('woff2');}
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 :root {
   --bg: #000; --s0: #060606; --s1: #0E0E0E; --s2: #161616; --s3: #232323; --s4: #303030;
@@ -236,6 +238,9 @@ html, body, #root { height: 100%; background: #000; color: var(--text); overflow
 // SCHEMA & MIGRATIONS
 // ════════════════════════════════════════════════════════════════════════════
 const SCHEMA_VERSION = 12;
+// One-line "what changed" shown once after an update (post-reload changelog toast).
+// Bump together with package.json version on every release.
+const RELEASE_NOTE = "Offline-Modus: App läuft jetzt ohne Netz · Fonts self-hosted · Update-Hinweise";
 const STORAGE_KEY = "gsd-data";
 
 // localStorage wrapper that mimics Claude's window.storage API
@@ -6727,6 +6732,25 @@ function AppInner() {
   const [showSplash, setShowSplash] = useState(true); // Splash IMMER beim Start
   const [showQuickAdd, setShowQuickAdd] = useState(false);
   const fabLongPressTimer = useRef(null);
+  const [swUpdateReady, setSwUpdateReady] = useState(false);
+  const [changelog, setChangelog] = useState(null);
+
+  // Service-worker update banner: main.jsx fires this when a new version is cached & waiting.
+  useEffect(() => {
+    const onNeed = () => setSwUpdateReady(true);
+    window.addEventListener("gsd:sw-need-refresh", onNeed);
+    return () => window.removeEventListener("gsd:sw-need-refresh", onNeed);
+  }, []);
+
+  // Post-update changelog toast: if the running version differs from the last one we saw,
+  // show RELEASE_NOTE once, then remember the new version.
+  useEffect(() => {
+    try {
+      const seen = localStorage.getItem("gsd-seen-version");
+      if (seen && seen !== __APP_VERSION__) setChangelog(RELEASE_NOTE);
+      localStorage.setItem("gsd-seen-version", __APP_VERSION__);
+    } catch {}
+  }, []);
 
   // Widget state sync — write the today/tomorrow plan to Preferences (= Android SharedPreferences)
   // so the native widget can read it. Triggers WidgetRefresh plugin to repaint widgets.
@@ -6964,6 +6988,30 @@ function AppInner() {
     })();
   }, [state, loaded]);
 
+  // AUTO-BACKUP — once per day, write a rolling JSON snapshot to the Documents folder.
+  // Pure local safety net (works offline); no share-sheet, no user action.
+  useEffect(() => {
+    if (!loaded) return;
+    const isCap = typeof window !== "undefined" && !!window.Capacitor?.isNativePlatform?.();
+    if (!isCap) return;
+    (async () => {
+      try {
+        const last = localStorage.getItem("gsd-last-autobackup");
+        const today = localDate();
+        if (last === today) return; // already backed up today
+        const { view, ...persist } = state;
+        await Filesystem.writeFile({
+          path: "gsd-autobackup.json",
+          data: JSON.stringify(persist),
+          directory: Directory.Documents,
+          encoding: Encoding.UTF8,
+          recursive: true,
+        });
+        localStorage.setItem("gsd-last-autobackup", today);
+      } catch (e) { console.warn("auto-backup failed", e); }
+    })();
+  }, [loaded, state]);
+
   // ROLLOVER once per day
   useEffect(() => {
     if (!loaded) return;
@@ -7087,6 +7135,22 @@ function AppInner() {
   return (
     <>
       <style>{CSS}</style>
+      {swUpdateReady && (
+        <div onClick={() => { setSwUpdateReady(false); try { window.__gsdUpdateSW && window.__gsdUpdateSW(); } catch {} }}
+          style={{ position: "fixed", top: 0, left: 0, right: 0, zIndex: 9998, background: "var(--lime)", color: "#000", padding: "10px 16px", display: "flex", alignItems: "center", justifyContent: "center", gap: 10, cursor: "pointer", fontWeight: 700, fontSize: 13 }}>
+          <span>🔄 Neue Version verfügbar — Jetzt neu laden</span>
+        </div>
+      )}
+      {changelog && (
+        <div style={{ position: "fixed", bottom: 76, left: 14, right: 14, zIndex: 9998, background: "var(--s2)", border: "1px solid var(--lime)", borderRadius: 12, padding: "12px 14px", display: "flex", alignItems: "flex-start", gap: 10, boxShadow: "0 8px 28px rgba(0,0,0,0.6)" }}>
+          <span style={{ fontSize: 18 }}>✨</span>
+          <div style={{ flex: 1 }}>
+            <div style={{ fontWeight: 700, fontSize: 13, color: "var(--lime)" }}>Aktualisiert auf v{__APP_VERSION__}</div>
+            <div style={{ fontSize: 12, color: "var(--text)", marginTop: 3, lineHeight: 1.4 }}>{changelog}</div>
+          </div>
+          <button onClick={() => setChangelog(null)} className="btn btn-ghost btn-icon" style={{ width: 26, height: 26 }}><X size={13} /></button>
+        </div>
+      )}
       <div className="app">
         <CelebrationOverlay />
         <AchievementToast />
