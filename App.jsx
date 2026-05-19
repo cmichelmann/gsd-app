@@ -240,7 +240,7 @@ html, body, #root { height: 100%; background: #000; color: var(--text); overflow
 const SCHEMA_VERSION = 13;
 // One-line "what changed" shown once after an update (post-reload changelog toast).
 // Bump together with package.json version on every release.
-const RELEASE_NOTE = "Gratitude-Upgrade: Kategorien, Prompts, Wochen-Recap, Throwback · Backup-Historie (7 Tage)";
+const RELEASE_NOTE = "Schnell-Erfassung: Tasks/Termine per Satz oder Sprache anlegen (z.B. \"Zahnarzt morgen 14 Uhr #health !hoch\")";
 const STORAGE_KEY = "gsd-data";
 
 // localStorage wrapper that mimics Claude's window.storage API
@@ -2041,7 +2041,132 @@ function SplashScreen({ onStart }) {
 // ════════════════════════════════════════════════════════════════════════════
 // MODALS
 // ════════════════════════════════════════════════════════════════════════════
-function AddTaskModal({ onClose, onAdd, projects, settings }) {
+// ════════════════════════════════════════════════════════════════════════════
+// NATURAL-LANGUAGE QUICK-ADD — deterministic German rule parser (no LLM, offline)
+// Returns a structured intent; the modal prefills its form from it (review then save).
+// ════════════════════════════════════════════════════════════════════════════
+const NLQ_WEEKDAYS = [
+  ["montag", "mo"], ["dienstag", "di"], ["mittwoch", "mi"], ["donnerstag", "do"],
+  ["freitag", "fr"], ["samstag", "sa", "sonnabend"], ["sonntag", "so"],
+]; // index 0=Mon … 6=Sun (matches (getDay()+6)%7)
+function parseQuickAdd(text) {
+  const original = String(text || "");
+  let s = " " + original.toLowerCase() + " ";
+  const consumed = [];
+  const eat = (re) => { s = s.replace(re, (m) => { consumed.push(m.trim()); return " "; }); };
+  const today = new Date(); today.setHours(12, 0, 0, 0);
+  const iso = (d) => localDate(d);
+  let date = null, time = null, durationMin = null, category = null, priority = null, frog = false, recurrence = null;
+
+  // kind
+  let kind = "task";
+  if (/geburtstag|🎂/i.test(original)) kind = "birthday";
+  else if (/\btermin\b/i.test(s)) kind = "event";
+
+  // recurrence
+  if (/\b(t[äa]glich|jeden tag)\b/.test(s)) { recurrence = { type: "daily" }; eat(/\b(t[äa]glich|jeden tag)\b/); }
+  else if (/\bw[öo]chentlich\b/.test(s)) { recurrence = { type: "weekly" }; eat(/\bw[öo]chentlich\b/); }
+  else if (/\bmonatlich\b/.test(s)) { recurrence = { type: "monthly" }; eat(/\bmonatlich\b/); }
+  else if (/\b(j[äa]hrlich|jedes jahr)\b/.test(s)) { recurrence = { type: "yearly" }; eat(/\b(j[äa]hrlich|jedes jahr)\b/); }
+  else {
+    const jm = s.match(/\bjeden\s+(montag|dienstag|mittwoch|donnerstag|freitag|samstag|sonnabend|sonntag)\b/);
+    if (jm) {
+      const wi = NLQ_WEEKDAYS.findIndex(a => a.includes(jm[1]));
+      recurrence = { type: "weekly", weekdays: wi >= 0 ? [wi] : [] };
+      eat(/\bjeden\s+(montag|dienstag|mittwoch|donnerstag|freitag|samstag|sonnabend|sonntag)\b/);
+    }
+  }
+
+  // explicit date D.M. / D.M.YYYY
+  const dm = s.match(/\b(\d{1,2})\.(\d{1,2})\.(\d{2,4})?\b/);
+  if (dm) {
+    let [, dd, mm, yy] = dm;
+    let year = yy ? (yy.length === 2 ? 2000 + +yy : +yy) : today.getFullYear();
+    let d = new Date(year, +mm - 1, +dd, 12, 0, 0);
+    if (!yy && d < today) d = new Date(year + 1, +mm - 1, +dd, 12, 0, 0);
+    if (!isNaN(d)) { date = iso(d); eat(/\b\d{1,2}\.\d{1,2}\.(\d{2,4})?\b/); }
+  }
+  // relative day words
+  if (!date) {
+    if (/\b[üu]bermorgen\b/.test(s)) { const d = new Date(today); d.setDate(d.getDate() + 2); date = iso(d); eat(/\b[üu]bermorgen\b/); }
+    else if (/\bmorgen\b/.test(s)) { const d = new Date(today); d.setDate(d.getDate() + 1); date = iso(d); eat(/\bmorgen\b/); }
+    else if (/\bheute\b/.test(s)) { date = iso(today); eat(/\bheute\b/); }
+    else if (/\b(n[äa]chste woche)\b/.test(s)) { const d = new Date(today); d.setDate(d.getDate() + 7); date = iso(d); eat(/\bn[äa]chste woche\b/); }
+  }
+  if (!date) {
+    const inN = s.match(/\bin\s+(\d{1,3})\s+(tag|tagen|woche|wochen)\b/);
+    if (inN) {
+      const n = +inN[1]; const d = new Date(today);
+      d.setDate(d.getDate() + (/woche/.test(inN[2]) ? n * 7 : n));
+      date = iso(d); eat(/\bin\s+\d{1,3}\s+(tag|tagen|woche|wochen)\b/);
+    }
+  }
+  if (!date) {
+    for (let i = 0; i < NLQ_WEEKDAYS.length; i++) {
+      const names = NLQ_WEEKDAYS[i];
+      const re = new RegExp("\\b(" + names.join("|") + ")\\b");
+      if (re.test(s)) {
+        const todWd = (today.getDay() + 6) % 7;
+        let add = (i - todWd + 7) % 7;
+        if (add === 0) add = 7; // "Montag" said on Monday → next Monday
+        const d = new Date(today); d.setDate(d.getDate() + add);
+        date = iso(d); eat(re);
+        break;
+      }
+    }
+  }
+
+  // time: "halb 9" → 08:30
+  const halb = s.match(/\bhalb\s+(\d{1,2})\b/);
+  if (halb) { const h = (+halb[1] + 23) % 24; time = `${String(h).padStart(2, "0")}:30`; eat(/\bhalb\s+\d{1,2}\b/); }
+  if (!time) {
+    const t1 = s.match(/\b(\d{1,2}):(\d{2})\b/);
+    if (t1) { time = `${String(+t1[1]).padStart(2, "0")}:${t1[2]}`; eat(/\b\d{1,2}:\d{2}\s*(uhr)?\b/); }
+  }
+  if (!time) {
+    const t2 = s.match(/\b(?:um\s+)?(\d{1,2})\s*uhr\b/);
+    if (t2) { time = `${String(+t2[1]).padStart(2, "0")}:00`; eat(/\b(um\s+)?\d{1,2}\s*uhr\b/); }
+  }
+
+  // duration
+  const durH = s.match(/\b(\d+(?:[.,]\d+)?)\s*(h|std|stunde|stunden)\b/);
+  if (durH) { durationMin = Math.round(parseFloat(durH[1].replace(",", ".")) * 60); eat(/\b\d+(?:[.,]\d+)?\s*(h|std|stunde|stunden)\b/); }
+  const durM = s.match(/\b(\d+)\s*(min|minute|minuten)\b/);
+  if (durM) { durationMin = (durationMin || 0) + (+durM[1]); eat(/\b\d+\s*(min|minute|minuten)\b/); }
+
+  // priority + frog
+  if (/!!|#frosch|#shit/.test(s)) { frog = true; priority = 3; eat(/!!|#frosch|#shit/g); }
+  if (priority == null) {
+    if (/!\s*(hoch|wichtig|3)\b/.test(s)) { priority = 3; eat(/!\s*(hoch|wichtig|3)\b/); }
+    else if (/!\s*(mittel|2)\b/.test(s)) { priority = 2; eat(/!\s*(mittel|2)\b/); }
+    else if (/!\s*(niedrig|gering|1)\b/.test(s)) { priority = 1; eat(/!\s*(niedrig|gering|1)\b/); }
+  }
+
+  // category via #tag
+  const catSynonyms = { sport: "health", gesundheit: "health", job: "arbeit", arbeit: "arbeit", privat: "privat",
+    haushalt: "haushalt", sozial: "social", social: "social", urlaub: "urlaub", lernen: "lernen", studium: "lernen" };
+  const tagM = s.match(/#([a-zäöüß]+)/);
+  if (tagM) {
+    const raw = tagM[1];
+    const byId = CATS.find(c => c.id === raw);
+    const byLabel = CATS.find(c => c.label.toLowerCase() === raw);
+    category = byId?.id || byLabel?.id || catSynonyms[raw] || null;
+    if (category) eat(/#[a-zäöüß]+/);
+  }
+
+  // title = original minus consumed tokens
+  let title = original;
+  consumed.forEach(tok => {
+    if (!tok) return;
+    title = title.replace(new RegExp(tok.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i"), " ");
+  });
+  title = title.replace(/\s{2,}/g, " ").replace(/\s+([.,;:])/g, "$1").trim();
+  if (!title) title = original.trim();
+
+  return { kind, title, date, time, durationMin, category, priority, frog, recurrence };
+}
+
+function AddTaskModal({ onClose, onAdd, projects, settings, onSwitchToEvent }) {
   const [title, setTitle] = useState("");
   const [notes, setNotes] = useState("");
   const [cat, setCat] = useState("privat");
@@ -2060,6 +2185,32 @@ function AddTaskModal({ onClose, onAdd, projects, settings }) {
   const [recType, setRecType] = useState("none");
   const [recWeekdays, setRecWeekdays] = useState([]);
   const voice = useVoiceInput((text) => setTitle(prev => (prev ? prev + " " : "") + text));
+  const [quick, setQuick] = useState("");
+  const [parsedHint, setParsedHint] = useState(null); // {kind, fields:[labels]}
+  const quickVoice = useVoiceInput((text) => setQuick(prev => (prev ? prev + " " : "") + text));
+
+  const applyParsed = (raw) => {
+    const txt = (raw ?? quick).trim();
+    if (!txt) return;
+    const p = parseQuickAdd(txt);
+    if ((p.kind === "event" || p.kind === "birthday") && onSwitchToEvent) {
+      onSwitchToEvent(p);
+      return;
+    }
+    const got = [];
+    setTitle(p.title); got.push("Titel");
+    if (p.date) { setStartDate(p.date); setEndDate(p.date); got.push("Datum"); }
+    if (p.time) { setAllDay(false); setStartTime(p.time); got.push("Zeit"); }
+    if (p.category) { setCat(p.category); got.push("Kategorie"); }
+    if (p.priority) { setPrio(p.priority); got.push("Priorität"); }
+    if (p.frog) { setIsFrog(true); got.push("💩"); }
+    if (p.recurrence) {
+      setRecType(p.recurrence.type);
+      if (p.recurrence.type === "weekly" && p.recurrence.weekdays) setRecWeekdays(p.recurrence.weekdays);
+      got.push("Wiederholung");
+    }
+    setParsedHint({ kind: p.kind, fields: got });
+  };
 
   const submit = () => {
     if (!title.trim()) return;
@@ -2086,8 +2237,32 @@ function AddTaskModal({ onClose, onAdd, projects, settings }) {
           <button onClick={onClose} className="btn btn-ghost btn-icon"><X size={18} /></button>
         </div>
         <div className="col" style={{ gap: 12 }}>
+          <div style={{ background: "var(--s1)", border: "1px solid var(--lime)", borderRadius: "var(--r-sm)", padding: 10 }}>
+            <div className="label" style={{ marginBottom: 6, color: "var(--lime)" }}>⚡ Schnell-Erfassung — tippen oder sprechen</div>
+            <div style={{ position: "relative" }}>
+              <input
+                className="input"
+                placeholder='z.B. "Zahnarzt morgen 14 Uhr #health !hoch"'
+                value={quick}
+                onChange={e => setQuick(e.target.value)}
+                onKeyDown={e => { if (e.key === "Enter") { e.preventDefault(); applyParsed(); } }}
+                style={{ paddingRight: 78, fontSize: 13 }}
+              />
+              {quickVoice.supported && (
+                <button onClick={quickVoice.listening ? quickVoice.stop : quickVoice.start} style={{ position: "absolute", right: 40, top: 6, width: 32, height: 32, borderRadius: 6, border: "none", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", background: quickVoice.listening ? "var(--lime)" : "var(--s3)", color: quickVoice.listening ? "#000" : "var(--lime)" }}>
+                  {quickVoice.listening ? <MicOff size={15} /> : <Mic size={15} />}
+                </button>
+              )}
+              <button onClick={() => applyParsed()} style={{ position: "absolute", right: 6, top: 6, width: 30, height: 32, borderRadius: 6, border: "none", cursor: "pointer", background: "var(--lime)", color: "#000", fontWeight: 700 }}>→</button>
+            </div>
+            {parsedHint && (
+              <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 6 }}>
+                ✓ Erkannt &amp; übernommen: {parsedHint.fields.join(" · ") || "Titel"}
+              </div>
+            )}
+          </div>
           <div style={{ position: "relative" }}>
-            <input className="input" placeholder="Was muss gedone sein?" value={title} onChange={e => setTitle(e.target.value)} onKeyDown={e => e.key === "Enter" && !e.shiftKey && submit()} autoFocus style={{ paddingRight: 44 }} />
+            <input className="input" placeholder="Was muss gedone sein?" value={title} onChange={e => setTitle(e.target.value)} onKeyDown={e => e.key === "Enter" && !e.shiftKey && submit()} style={{ paddingRight: 44 }} />
             {voice.supported && (
               <button onClick={voice.listening ? voice.stop : voice.start} style={{ position: "absolute", right: 6, top: 6, width: 36, height: 36, borderRadius: 6, border: "none", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", background: voice.listening ? "var(--lime)" : "var(--s3)", color: voice.listening ? "#000" : "var(--lime)" }}>
                 {voice.listening ? <MicOff size={16} /> : <Mic size={16} />}
@@ -2184,18 +2359,19 @@ function AddTaskModal({ onClose, onAdd, projects, settings }) {
   );
 }
 
-function AddEventModal({ onClose, onAdd, defaultDate, defaultType, settings }) {
-  const [title, setTitle] = useState("");
-  const [type, setType] = useState(defaultType || "event");
-  const [allDay, setAllDay] = useState(true);
-  const [startDate, setStartDate] = useState(defaultDate || localDate());
-  const [endDate, setEndDate] = useState("");
-  const [startTime, setStartTime] = useState("");
+function AddEventModal({ onClose, onAdd, defaultDate, defaultType, settings, initial }) {
+  const initType = initial?.kind === "birthday" ? "birthday" : (defaultType || (initial ? "event" : "event"));
+  const [title, setTitle] = useState(initial?.title || "");
+  const [type, setType] = useState(initType);
+  const [allDay, setAllDay] = useState(initial?.time ? false : true);
+  const [startDate, setStartDate] = useState(initial?.date || defaultDate || localDate());
+  const [endDate, setEndDate] = useState(initial?.date || "");
+  const [startTime, setStartTime] = useState(initial?.time || "");
   const [endTime, setEndTime] = useState("");
   const [notes, setNotes] = useState("");
-  const reminderDefault = (defaultType === "birthday" ? settings?.defaultBirthdayReminder : settings?.defaultEventReminder) ?? (defaultType === "birthday" ? 1440 : 30);
+  const reminderDefault = (initType === "birthday" ? settings?.defaultBirthdayReminder : settings?.defaultEventReminder) ?? (initType === "birthday" ? 1440 : 30);
   const [reminderMinutes, setReminderMinutes] = useState(reminderDefault);
-  const [yearly, setYearly] = useState(false);
+  const [yearly, setYearly] = useState(initial?.recurrence?.type === "yearly");
   const [birthYear, setBirthYear] = useState("");
   const [superMode, setSuperMode] = useState(false);
 
@@ -6904,6 +7080,7 @@ function AppInner() {
   const [showAddEvent, setShowAddEvent] = useState(false);
   const [addEventDate, setAddEventDate] = useState(null);
   const [quickAddType, setQuickAddType] = useState(null); // "birthday" | "vacation" | null
+  const [eventPrefill, setEventPrefill] = useState(null); // NLQ → switch task→event
   const [showAddWorkout, setShowAddWorkout] = useState(false);
   const [editingWorkout, setEditingWorkout] = useState(null);
   const [openTaskId, setOpenTaskId] = useState(null);
@@ -7439,8 +7616,8 @@ function AppInner() {
           ))}
         </nav>
 
-        {showAddTask && <AddTaskModal onClose={() => setShowAddTask(false)} onAdd={t => dispatch({ type: "ADD_TASK", payload: t })} projects={state.projects} settings={state.settings} />}
-        {showAddEvent && <AddEventModal defaultDate={addEventDate} defaultType={quickAddType} settings={state.settings} onClose={() => { setShowAddEvent(false); setAddEventDate(null); setQuickAddType(null); }} onAdd={e => dispatch({ type: "ADD_EVENT", payload: e })} />}
+        {showAddTask && <AddTaskModal onClose={() => setShowAddTask(false)} onAdd={t => dispatch({ type: "ADD_TASK", payload: t })} projects={state.projects} settings={state.settings} onSwitchToEvent={(p) => { setShowAddTask(false); setEventPrefill(p); setShowAddEvent(true); }} />}
+        {showAddEvent && <AddEventModal defaultDate={addEventDate} defaultType={quickAddType} initial={eventPrefill} settings={state.settings} onClose={() => { setShowAddEvent(false); setAddEventDate(null); setQuickAddType(null); setEventPrefill(null); }} onAdd={e => dispatch({ type: "ADD_EVENT", payload: e })} />}
         {showAddWorkout && <AddWorkoutModal settings={state.settings} onClose={() => setShowAddWorkout(false)} onAdd={w => dispatch({ type: "ADD_WORKOUT", payload: w })} />}
         {editingWorkout && <AddWorkoutModal editing={editingWorkout} settings={state.settings} onClose={() => setEditingWorkout(null)} onAdd={() => {}} onUpdate={w => dispatch({ type: "UPD_WORKOUT", payload: w })} onDelete={id => dispatch({ type: "DEL_WORKOUT", payload: id })} />}
         {taskDetail && <TaskDetailModal task={taskDetail} onClose={() => setOpenTaskId(null)} dispatch={dispatch} projects={state.projects} openPomo={openPomo} />}
