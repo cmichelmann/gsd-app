@@ -235,7 +235,7 @@ html, body, #root { height: 100%; background: #000; color: var(--text); overflow
 // ════════════════════════════════════════════════════════════════════════════
 // SCHEMA & MIGRATIONS
 // ════════════════════════════════════════════════════════════════════════════
-const SCHEMA_VERSION = 11;
+const SCHEMA_VERSION = 12;
 const STORAGE_KEY = "gsd-data";
 
 // localStorage wrapper that mimics Claude's window.storage API
@@ -284,7 +284,7 @@ function getDefaults() {
       morningNudgeEnabled: true, morningNudgeTime: "09:00",
       // Super-Penetrations-Modus for every birthday (per-item flag overridden by this when on)
       superModeAllBirthdays: false,
-      calendarFilters: { tasks: true, events: true, vacation: true, birthdays: true, holidays: true, habits: true, sport: true },
+      calendarFilters: { tasks: true, events: true, vacation: true, birthdays: true, holidays: true, habits: true, sport: true, muell: false },
       searchHistory: [],
       featureGratitude: true, featureAchievements: true, featureHeatmap: true,
       showCustoms: true, showRemembrance: false,
@@ -332,7 +332,7 @@ const migrations = {
   5: (d) => ({ ...d, version: 5,
     tasks: (d.tasks || []).map(t => ({ ...t, completionHistory: t.completionHistory || [] })),
     settings: {
-      calendarFilters: { tasks: true, events: true, vacation: true, birthdays: true, holidays: true, habits: true, sport: true },
+      calendarFilters: { tasks: true, events: true, vacation: true, birthdays: true, holidays: true, habits: true, sport: true, muell: false },
       ...(d.settings || {}),
     },
   }),
@@ -380,6 +380,13 @@ const migrations = {
   11: (d) => ({
     ...d, version: 11,
     settings: { superModeAllBirthdays: false, ...(d.settings || {}) },
+  }),
+  12: (d) => ({
+    ...d, version: 12,
+    settings: {
+      ...(d.settings || {}),
+      calendarFilters: { tasks: true, events: true, vacation: true, birthdays: true, holidays: true, habits: true, sport: true, muell: false, ...((d.settings || {}).calendarFilters || {}) },
+    },
   }),
 };
 
@@ -548,7 +555,116 @@ const EVENT_TYPES = [
   { id: "event",    label: "Termin",     icon: Calendar, color: "#00E0FF" },
   { id: "birthday", label: "Geburtstag", icon: Cake,     color: "#FF2D78" },
   { id: "vacation", label: "Urlaub",     icon: Plane,    color: "#FF6B35" },
+  { id: "muell",    label: "Müll",       icon: Trash2,   color: "#8B6F47" },
 ];
+// Per-bin colour/icon, derived from the iCal SUMMARY keyword.
+function muellBinStyle(summary) {
+  const s = (summary || "").toLowerCase();
+  if (s.includes("rest")) return { color: "#5A5A5A", icon: "⚫", label: "Restmüll" };
+  if (s.includes("bio")) return { color: "#8B5E3C", icon: "🟤", label: "Bio" };
+  if (s.includes("papier")) return { color: "#2E6FD9", icon: "🔵", label: "Papier" };
+  if (s.includes("wertstoff") || s.includes("gelb")) return { color: "#E8B500", icon: "🟡", label: "Wertstoff" };
+  if (s.includes("baum") || s.includes("garten") || s.includes("grün")) return { color: "#3FA34D", icon: "🌳", label: "Baumschnitt" };
+  return { color: "#8B6F47", icon: "🗑️", label: "Müll" };
+}
+
+// Minimal iCal (RFC 5545) parser — no RRULE expansion, no TZID conversion (v1 scope).
+// Handles line-folding, all-day (VALUE=DATE) and basic timed (UTC / floating) events.
+function icsUnescape(s) {
+  return String(s).replace(/\\n/gi, "\n").replace(/\\,/g, ",").replace(/\\;/g, ";").replace(/\\\\/g, "\\");
+}
+function parseICSDate(val, params) {
+  const v = (val || "").trim();
+  const dateOnly = params.some(p => p === "VALUE=DATE") || /^\d{8}$/.test(v);
+  if (dateOnly) {
+    const m = v.match(/^(\d{4})(\d{2})(\d{2})/);
+    if (!m) return null;
+    return { date: `${m[1]}-${m[2]}-${m[3]}`, allDay: true };
+  }
+  const m = v.match(/^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})?(Z)?/);
+  if (!m) return null;
+  const [, y, mo, da, hh, mi] = m;
+  const isUTC = m[7] === "Z";
+  const dt = isUTC
+    ? new Date(Date.UTC(+y, +mo - 1, +da, +hh, +mi))
+    : new Date(+y, +mo - 1, +da, +hh, +mi);
+  return {
+    date: localDate(dt),
+    time: `${String(dt.getHours()).padStart(2, "0")}:${String(dt.getMinutes()).padStart(2, "0")}`,
+    allDay: false,
+  };
+}
+function parseICS(text) {
+  const unfolded = String(text).replace(/\r\n/g, "\n").replace(/\r/g, "\n").replace(/\n[ \t]/g, "");
+  const lines = unfolded.split("\n");
+  const cal = { name: null, events: [] };
+  let cur = null;
+  for (const raw of lines) {
+    const line = raw;
+    if (line.startsWith("X-WR-CALNAME")) {
+      const i = line.indexOf(":");
+      if (i >= 0) cal.name = icsUnescape(line.slice(i + 1)).trim();
+      continue;
+    }
+    if (line === "BEGIN:VEVENT") { cur = {}; continue; }
+    if (line === "END:VEVENT") { if (cur && cur.start) cal.events.push(cur); cur = null; continue; }
+    if (!cur) continue;
+    const ci = line.indexOf(":");
+    if (ci < 0) continue;
+    const left = line.slice(0, ci);
+    const val = line.slice(ci + 1);
+    const parts = left.split(";");
+    const key = parts[0];
+    const params = parts.slice(1);
+    if (key === "UID") cur.uid = val.trim();
+    else if (key === "SUMMARY") cur.summary = icsUnescape(val).trim();
+    else if (key === "LOCATION") cur.location = icsUnescape(val).trim();
+    else if (key === "DESCRIPTION") cur.description = icsUnescape(val).trim();
+    else if (key === "DTSTART") cur.start = parseICSDate(val, params);
+    else if (key === "DTEND") cur.end = parseICSDate(val, params);
+  }
+  return cal;
+}
+// Convert a parsed ICS event into a GSD event object.
+function icsEventToGsd(ev, { type, reminderMinutes, source }) {
+  const startDate = ev.start.date;
+  let endDate = startDate;
+  if (ev.end) {
+    if (ev.end.allDay) {
+      // iCal DTEND is exclusive for all-day → subtract one day
+      const d = new Date(ev.end.date + "T12:00:00");
+      d.setDate(d.getDate() - 1);
+      endDate = localDate(d);
+      if (endDate < startDate) endDate = startDate;
+    } else {
+      endDate = ev.end.date;
+    }
+  }
+  const allDay = ev.start.allDay;
+  const isMuell = type === "muell";
+  const bin = isMuell ? muellBinStyle(ev.summary) : null;
+  let title = (ev.summary || "Termin").trim();
+  if (isMuell) title = title.replace(/^.*?[-–]\s*/, "").trim() || title; // strip "ELW - " prefix
+  return {
+    id: uid(),
+    title,
+    type,
+    startDate,
+    endDate,
+    allDay,
+    startTime: allDay ? "" : (ev.start.time || ""),
+    endTime: allDay ? "" : (ev.end && !ev.end.allDay ? ev.end.time : ""),
+    notes: [ev.location, ev.description].filter(Boolean).join(" · "),
+    color: isMuell ? bin.color : eventTypeOf(type).color,
+    reminderMinutes: Number(reminderMinutes) || 0,
+    recurrence: null,
+    isHoliday: false,
+    createdAt: Date.now(),
+    icalUid: ev.uid || null,
+    icalSource: source || null,
+    ...(isMuell ? { muellBin: bin.label, muellIcon: bin.icon } : {}),
+  };
+}
 const WORKOUT_TYPES = [
   { id: "strength", label: "Kraft",      emoji: "💪", color: "#AAFF00" },
   { id: "cardio",   label: "Ausdauer",   emoji: "🏃", color: "#00E0FF" },
@@ -1186,7 +1302,7 @@ function buildDigestBody(state, dateStr) {
   const weekday = (dt.getDay() + 6) % 7;
   // Super-Penetrations items are excluded — they nag every 30 min already, no need in the digest.
   const tasks = state.tasks.filter(t => getTaskDates(t, dateStr, dateStr).includes(dateStr) && t.status !== "done" && !isSuperTask(t));
-  const events = state.events.filter(e => getEventDates(e, dateStr, dateStr).includes(dateStr) && !e.isHoliday && !isSuperEvent(e, state.settings, e.startDate));
+  const events = state.events.filter(e => getEventDates(e, dateStr, dateStr).includes(dateStr) && !e.isHoliday && !isSuperEvent(e, state.settings, e.startDate) && !muellHidden(e, state));
   const holidays = state.events.filter(e => getEventDates(e, dateStr, dateStr).includes(dateStr) && e.isHoliday && e.holidayKind === "legal");
   const workouts = state.workouts.filter(w => w.weekday === weekday);
   const habits = (state.habits || []).filter(h => {
@@ -1463,6 +1579,15 @@ function reducer(state, { type, payload }) {
     case "ADD_EVENT":   return touch({ ...state, events: [...state.events, payload] });
     case "UPD_EVENT":   return touch({ ...state, events: state.events.map(e => e.id === payload.id ? { ...e, ...payload } : e) });
     case "DEL_EVENT":   return touch({ ...state, events: state.events.filter(e => e.id !== payload), tasks: state.tasks.filter(t => t.giftEventId !== payload) });
+    case "IMPORT_ICAL": {
+      // payload: { events: [...] }. Dedupe against already-imported icalUid so a yearly
+      // re-import of the same calendar doesn't create duplicates.
+      const existingUids = new Set(state.events.filter(e => e.icalUid).map(e => e.icalUid));
+      const fresh = (payload.events || []).filter(e => !e.icalUid || !existingUids.has(e.icalUid));
+      return touch({ ...state, events: [...state.events, ...fresh] });
+    }
+    case "REMOVE_ICAL_SOURCE":
+      return touch({ ...state, events: state.events.filter(e => e.icalSource !== payload) });
     case "ADD_WORKOUT": return touch({ ...state, workouts: [...state.workouts, { ...payload, completions: payload.completions || {} }] });
     case "UPD_WORKOUT": return touch({ ...state, workouts: state.workouts.map(w => w.id === payload.id ? { ...w, ...payload } : w) });
     case "DEL_WORKOUT": return touch({ ...state, workouts: state.workouts.filter(w => w.id !== payload) });
@@ -1637,12 +1762,17 @@ function useNotifications(state) {
       (events || []).forEach(e => {
         if (!e.startDate || !e.reminderMinutes || e.isHoliday) return;
         const isBday = e.type === "birthday";
+        const isMuell = e.type === "muell";
         if (isBday && !settings.notifBirthdays) return;
-        if (!isBday && !settings.notifEvents) return;
+        if (isMuell && !settings.calendarFilters?.muell) return; // hidden filter ⇒ no pushes
+        if (!isBday && !isMuell && !settings.notifEvents) return;
         const time = e.startTime || "09:00";
         const dueMs = new Date(`${e.startDate}T${time}:00`).getTime();
+        // Near-term clamp: never schedule a reminder more than 60 days out. The daily
+        // re-sync rolls the window forward — bounds the queue regardless of import size.
+        if (dueMs - e.reminderMinutes * 60000 > Date.now() + 60 * 86400000) return;
         const occurrenceDate = e.startDate;
-        const icon = isBday ? "🎂" : e.type === "vacation" ? "✈️" : "📅";
+        const icon = isMuell ? (e.muellIcon || "🗑️") : isBday ? "🎂" : e.type === "vacation" ? "✈️" : "📅";
         let body = e.notes || "Erinnerung";
         if (isBday && e.birthYear) {
           const age = new Date(e.startDate + "T12:00:00").getFullYear() - e.birthYear;
@@ -2084,7 +2214,7 @@ function AddEventModal({ onClose, onAdd, defaultDate, defaultType, settings }) {
           <input className="input" placeholder="Titel..." value={title} onChange={e => setTitle(e.target.value)} autoFocus />
           <div><label className="label">Typ</label>
             <div className="row" style={{ gap: 6 }}>
-              {EVENT_TYPES.map(t => (
+              {EVENT_TYPES.filter(t => t.id !== "muell").map(t => (
                 <button key={t.id} className={`chip ${type === t.id ? "on" : ""}`} onClick={() => setType(t.id)} style={{ flex: 1, justifyContent: "center" }}>
                   <t.icon size={13} /> {t.label}
                 </button>
@@ -2436,7 +2566,7 @@ function EventDetailModal({ event, onClose, dispatch }) {
           <div className="col" style={{ gap: 10 }}>
             <div><label className="label">Typ</label>
               <div className="row" style={{ gap: 5, flexWrap: "wrap" }}>
-                {EVENT_TYPES.map(tt => (
+                {EVENT_TYPES.filter(tt => tt.id !== "muell" || draft.type === "muell").map(tt => (
                   <button key={tt.id} className={`chip ${draft.type === tt.id ? "on" : ""}`} onClick={() => setDraft({ ...draft, type: tt.id, color: tt.color })}>
                     <tt.icon size={11} /> {tt.label}
                   </button>
@@ -3220,6 +3350,43 @@ function SettingsModal({ state, dispatch, onClose }) {
     };
     reader.readAsText(file);
   };
+  // iCal import — parse the .ics, then show a preview/assign dialog before committing.
+  const [icalPreview, setIcalPreview] = useState(null); // { name, events:[parsed], type, reminder }
+  const importICal = (file) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const cal = parseICS(e.target.result);
+        if (!cal.events.length) { alert("Keine Termine in der Datei gefunden."); return; }
+        const looksWaste = /abfall|müll|muell|tonne|entsorgung/i.test(cal.name || "");
+        setIcalPreview({
+          name: cal.name || "Importierter Kalender",
+          events: cal.events,
+          type: looksWaste ? "muell" : "event",
+          reminder: looksWaste ? 900 : 0, // 900 min = Vortag 18:00 für Ganztags (09:00-Basis)
+        });
+      } catch (err) { alert("iCal-Datei konnte nicht gelesen werden: " + (err?.message || "unbekannt")); }
+    };
+    reader.readAsText(file);
+  };
+  const commitICalImport = () => {
+    if (!icalPreview) return;
+    const events = icalPreview.events.map(ev => icsEventToGsd(ev, {
+      type: icalPreview.type,
+      reminderMinutes: icalPreview.reminder,
+      source: icalPreview.name,
+    }));
+    const existingUids = new Set((state.events || []).filter(e => e.icalUid).map(e => e.icalUid));
+    const newCount = events.filter(e => !e.icalUid || !existingUids.has(e.icalUid)).length;
+    dispatch({ type: "IMPORT_ICAL", payload: { events } });
+    setIcalPreview(null);
+    alert(`✓ ${newCount} neue Einträge importiert${newCount !== events.length ? ` (${events.length - newCount} Duplikate übersprungen)` : ""}.`);
+  };
+  const icalSources = useMemo(() => {
+    const s = {};
+    (state.events || []).forEach(e => { if (e.icalSource) s[e.icalSource] = (s[e.icalSource] || 0) + 1; });
+    return Object.entries(s);
+  }, [state.events]);
   const doWipe = () => {
     dispatch({ type: "WIPE_USER_DATA" });
     setWipeStep(0);
@@ -3516,6 +3683,63 @@ function SettingsModal({ state, dispatch, onClose }) {
             <Upload size={14} /> Backup importieren
             <input type="file" accept=".json" onChange={e => e.target.files[0] && importData(e.target.files[0])} style={{ display: "none" }} />
           </label>
+
+          {/* iCal / Kalender-Import */}
+          <div className="section-title">📅 Kalender-Import (.ics)</div>
+          <label className="btn btn-ghost" style={{ cursor: "pointer" }}>
+            <Calendar size={14} /> iCal-Datei importieren
+            <input type="file" accept=".ics,text/calendar" onChange={e => { if (e.target.files[0]) { importICal(e.target.files[0]); e.target.value = ""; } }} style={{ display: "none" }} />
+          </label>
+          {icalSources.length > 0 && (
+            <div className="card-sm">
+              <div className="stat-label" style={{ marginBottom: 6 }}>Importierte Kalender</div>
+              {icalSources.map(([src, cnt]) => (
+                <div key={src} className="between" style={{ padding: "4px 0" }}>
+                  <span style={{ fontSize: 12 }}>{src} · {cnt}</span>
+                  <button className="btn btn-ghost" style={{ padding: "3px 8px", fontSize: 10, color: "#FF3B3B" }}
+                    onClick={() => { if (confirm(`Alle ${cnt} Einträge aus "${src}" entfernen?`)) dispatch({ type: "REMOVE_ICAL_SOURCE", payload: src }); }}>
+                    Entfernen
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+          {icalPreview && (
+            <div className="overlay center" onClick={e => e.target === e.currentTarget && setIcalPreview(null)}>
+              <div className="modal center">
+                <div className="between" style={{ marginBottom: 12 }}>
+                  <h3 className="display" style={{ fontSize: 18 }}>📅 iCal importieren</h3>
+                  <button className="btn btn-ghost btn-icon" onClick={() => setIcalPreview(null)}><X size={18} /></button>
+                </div>
+                <div className="card-sm" style={{ marginBottom: 12 }}>
+                  <div style={{ fontWeight: 600, fontSize: 14 }}>{icalPreview.name}</div>
+                  <div className="mono" style={{ fontSize: 11, color: "var(--muted)", marginTop: 4 }}>
+                    {icalPreview.events.length} Einträge · {icalPreview.events[0]?.start?.date} – {icalPreview.events[icalPreview.events.length - 1]?.start?.date}
+                  </div>
+                </div>
+                <div className="label">Als Typ importieren</div>
+                <div className="row" style={{ gap: 6, marginBottom: 12, flexWrap: "wrap" }}>
+                  {EVENT_TYPES.map(t => (
+                    <button key={t.id} className={`chip ${icalPreview.type === t.id ? "on" : ""}`}
+                      onClick={() => setIcalPreview(p => ({ ...p, type: t.id }))}>
+                      <t.icon size={12} /> {t.label}
+                    </button>
+                  ))}
+                </div>
+                <div className="label">Erinnerung</div>
+                <select className="select" value={icalPreview.reminder} onChange={e => setIcalPreview(p => ({ ...p, reminder: Number(e.target.value) }))} style={{ marginBottom: 14 }}>
+                  <option value={0}>Keine</option>
+                  <option value={900}>Am Vortag 18:00 Uhr</option>
+                  <option value={1440}>1 Tag vorher</option>
+                  <option value={120}>2 Std vorher</option>
+                </select>
+                <div className="row" style={{ gap: 8 }}>
+                  <button className="btn btn-ghost" onClick={() => setIcalPreview(null)} style={{ flex: 1 }}>Abbrechen</button>
+                  <button className="btn btn-primary" onClick={commitICalImport} style={{ flex: 2 }}>Importieren</button>
+                </div>
+              </div>
+            </div>
+          )}
           <div className="card-sm">
             <div className="stat-label">App-Version</div>
             <div className="mono" style={{ fontSize: 14, marginTop: 4, color: "var(--lime)" }}>v{__APP_VERSION__}</div>
@@ -3610,11 +3834,14 @@ function DailyRitualModal({ tasks, dispatch, onClose }) {
 // ════════════════════════════════════════════════════════════════════════════
 // VIEWS
 // ════════════════════════════════════════════════════════════════════════════
+function muellHidden(e, state) {
+  return e.type === "muell" && !(state.settings?.calendarFilters?.muell);
+}
 function buildDayItems(state, dateStr) {
   const dt = new Date(dateStr + "T12:00:00");
   const weekday = (dt.getDay() + 6) % 7;
   const tasks = state.tasks.filter(t => getTaskDates(t, dateStr, dateStr).includes(dateStr) && t.status !== "done");
-  const events = state.events.filter(e => getEventDates(e, dateStr, dateStr).includes(dateStr));
+  const events = state.events.filter(e => getEventDates(e, dateStr, dateStr).includes(dateStr) && !muellHidden(e, state));
   const workouts = state.workouts.filter(w => w.weekday === weekday);
   const habits = (state.habits || []).filter(h => {
     if (h.frequency === "daily") {
@@ -4066,11 +4293,13 @@ function MonthView({ state, dispatch, openTask, openEvent, openAddEvent }) {
     state.events.forEach(e => {
       const isBday = e.type === "birthday";
       const isVac = e.type === "vacation";
+      const isMuell = e.type === "muell";
       const isHol = e.isHoliday;
       if (isHol && !filters.holidays) return;
       if (isBday && !filters.birthdays) return;
       if (isVac && !filters.vacation) return;
-      if (!isHol && !isBday && !isVac && !filters.events) return;
+      if (isMuell && !filters.muell) return;
+      if (!isHol && !isBday && !isVac && !isMuell && !filters.events) return;
       getEventDates(e, winStart, winEnd).forEach(d => { (m[d] = m[d] || []).push({ kind: "event", item: e }); });
     });
     if (filters.sport) state.workouts.forEach(w => getWorkoutDates(w, winStart, winEnd).forEach(d => { (m[d] = m[d] || []).push({ kind: "workout", item: w }); }));
@@ -4086,6 +4315,7 @@ function MonthView({ state, dispatch, openTask, openEvent, openAddEvent }) {
     { id: "holidays", label: "Feiertage", emoji: "🎉" },
     { id: "sport", label: "Sport", emoji: "💪" },
     { id: "habits", label: "Habits", emoji: "🔥" },
+    { id: "muell", label: "Müll", emoji: "🗑️" },
   ];
 
   return (
@@ -6507,7 +6737,7 @@ function AppInner() {
     const dt = new Date(today + "T12:00:00");
     const dayLabel = dt.toLocaleDateString("de-DE", { weekday: "short", day: "numeric", month: "long" });
     const items = [];
-    const events = state.events.filter(e => getEventDates(e, today, today).includes(today) && !e.isHoliday);
+    const events = state.events.filter(e => getEventDates(e, today, today).includes(today) && !e.isHoliday && !muellHidden(e, state));
     const tasks = state.tasks.filter(t => getTaskDates(t, today, today).includes(today) && t.status !== "done");
     const weekday = (dt.getDay() + 6) % 7;
     const workouts = state.workouts.filter(w => w.weekday === weekday);
@@ -6517,7 +6747,7 @@ function AppInner() {
       return h.weekdays.includes(weekday);
     });
     events.forEach(e => items.push({
-      icon: e.type === "birthday" ? "🎂" : e.type === "vacation" ? "✈️" : "📅",
+      icon: e.type === "muell" ? (e.muellIcon || "🗑️") : e.type === "birthday" ? "🎂" : e.type === "vacation" ? "✈️" : "📅",
       time: e.startTime || "",
       title: e.title,
       deepLink: `gsd://event/${e.id}`,
