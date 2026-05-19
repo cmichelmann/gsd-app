@@ -1383,6 +1383,22 @@ function reducer(state, { type, payload }) {
     case "ADD_TASK":      return touch({ ...state, tasks: [payload, ...state.tasks] });
     case "UPD_TASK":      return touch({ ...state, tasks: state.tasks.map(t => t.id === payload.id ? { ...t, ...payload } : t) });
     case "DEL_TASK":      return touch({ ...state, tasks: state.tasks.filter(t => t.id !== payload) });
+    case "ARCHIVE_ALL_DONE": {
+      // Bulk-clear the Done column: archive one-off done tasks, and for recurring tasks
+      // hide their completion-history projections up to today (completionHistory stays
+      // intact so Statistik/Heatmap are unaffected).
+      const cutoff = localDate();
+      return touch({ ...state, tasks: state.tasks.map(t => {
+        const recurring = t.recurrence && t.recurrence.type !== "none";
+        if (recurring && (t.completionHistory || []).length) {
+          return { ...t, historyArchivedBefore: cutoff };
+        }
+        if (!recurring && t.status === "done" && !t.archived) {
+          return { ...t, archived: true };
+        }
+        return t;
+      }) });
+    }
     case "MOVE_TASK": {
       return touch({ ...state, tasks: state.tasks.map(t => {
         if (t.id !== payload.id) return t;
@@ -3871,10 +3887,16 @@ function TasksView({ state, dispatch, openTask }) {
           if (col.id === "done") {
             archivedCount = colTasks.filter(t => t.archived).length;
             if (!showArchived) colTasks = colTasks.filter(t => !t.archived);
+            // Recurring completions: auto-prune to the last 7 days, and hide anything
+            // at/before the per-task historyArchivedBefore cutoff (set by "Alle archivieren").
+            const pruneBefore = localDate(addDays(new Date(), -7));
             const histEntries = [];
             filtered.forEach(t => {
               if (!t.recurrence || t.recurrence.type === "none") return;
+              const cutoff = t.historyArchivedBefore || "";
               (t.completionHistory || []).forEach(d => {
+                if (d < pruneBefore) return;          // older than 7 days → auto-pruned
+                if (cutoff && d <= cutoff) return;    // manually archived
                 histEntries.push({ ...t, _historical: true, _doneDate: d, id: `${t.id}__${d}`, status: "done" });
               });
             });
@@ -3894,6 +3916,20 @@ function TasksView({ state, dispatch, openTask }) {
                 </div>
                 <span style={{ background: "var(--s2)", borderRadius: 20, padding: "1px 8px", fontSize: 11, color: "var(--muted)" }}>{colTasks.length}</span>
               </div>
+              {col.id === "done" && colTasks.some(t => !t.archived) && (
+                <button
+                  onClick={() => {
+                    const n = colTasks.filter(t => !t.archived).length;
+                    if (window.confirm(`${n} erledigte Einträge archivieren?\n\nSie verschwinden aus der Spalte, bleiben aber in der Statistik erhalten.`)) {
+                      dispatch({ type: "ARCHIVE_ALL_DONE" });
+                    }
+                  }}
+                  className="btn btn-ghost"
+                  style={{ width: "100%", padding: "6px 8px", fontSize: 10, marginBottom: 8, color: "var(--lime)", borderColor: "var(--lime)", letterSpacing: "0.04em", textTransform: "uppercase" }}
+                >
+                  📦 Alle erledigten archivieren
+                </button>
+              )}
               {col.id === "done" && archivedCount > 0 && (
                 <button onClick={() => setShowArchived(v => !v)} className="btn btn-ghost" style={{ width: "100%", padding: "4px 8px", fontSize: 10, marginBottom: 8, color: "var(--muted)", letterSpacing: "0.04em", textTransform: "uppercase" }}>
                   {showArchived ? `📤 ${archivedCount} archivierte ausblenden` : `📦 ${archivedCount} archivierte anzeigen`}
