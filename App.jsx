@@ -240,7 +240,7 @@ html, body, #root { height: 100%; background: #000; color: var(--text); overflow
 const SCHEMA_VERSION = 13;
 // One-line "what changed" shown once after an update (post-reload changelog toast).
 // Bump together with package.json version on every release.
-const RELEASE_NOTE = "Schnell-Erfassung: Tasks/Termine per Satz oder Sprache anlegen (z.B. \"Zahnarzt morgen 14 Uhr #health !hoch\")";
+const RELEASE_NOTE = "Eisenhower-Matrix in den Aufgaben (Board \u2194 Matrix) \u2014 Karten zwischen Quadranten ziehen passt Prio/Datum an";
 const STORAGE_KEY = "gsd-data";
 
 // localStorage wrapper that mimics Claude's window.storage API
@@ -4313,24 +4313,69 @@ function DashboardView({ state, dispatch, openTask, openEvent, openPomo, setShow
   );
 }
 
+// Eisenhower derivation — no new data entry, computed from priority + due date.
+function ehIsUrgent(t) {
+  const eff = t.endDate || t.startDate;
+  if (!eff) return false;
+  const plus2 = localDate(addDays(new Date(), 2));
+  return eff <= plus2; // overdue or due within 2 days (YYYY-MM-DD string compare)
+}
+function ehIsImportant(t) {
+  return t.priority === 3 || !!t.isFrog;
+}
+
 function TasksView({ state, dispatch, openTask }) {
   const [filter, setFilter] = useState("all");
   const [showArchived, setShowArchived] = useState(false);
-  const onDrop = useCallback((id, status) => {
-    dispatch({ type: "MOVE_TASK", payload: { id, status } });
-    if (status === "done") fireCelebration();
-  }, [dispatch]);
+  const [viewMode, setViewMode] = useState("kanban"); // "kanban" | "matrix"
+  const onDrop = useCallback((id, zone) => {
+    if (zone && zone.startsWith("eh-")) {
+      // Eisenhower quadrant drop → mutate priority / due date to match the target.
+      const important = zone === "eh-q1" || zone === "eh-q2";
+      const urgent = zone === "eh-q1" || zone === "eh-q3";
+      const t = state.tasks.find(x => x.id === id);
+      if (!t) return;
+      const patch = { id };
+      patch.priority = important ? 3 : 1;
+      if (!important) patch.isFrog = false;
+      const today = localDate();
+      if (urgent) {
+        patch.startDate = today; patch.endDate = today;
+      } else {
+        const eff = t.endDate || t.startDate;
+        const plus2 = localDate(addDays(new Date(), 2));
+        if (eff && eff <= plus2) {
+          const d7 = localDate(addDays(new Date(), 7));
+          patch.startDate = d7; patch.endDate = d7;
+        }
+      }
+      dispatch({ type: "UPD_TASK", payload: patch });
+      return;
+    }
+    dispatch({ type: "MOVE_TASK", payload: { id, status: zone } });
+    if (zone === "done") fireCelebration();
+  }, [dispatch, state.tasks]);
   const { drag, startDrag } = useDragDrop(onDrop);
   const filtered = state.tasks.filter(t => {
     if (filter === "all") return true;
     if (filter === "frog") return t.isFrog;
     return t.priority === Number(filter);
   });
+  const matrixTasks = filtered.filter(t => t.status !== "done" && !t.archived);
+  const EH_QUADS = [
+    { id: "eh-q1", title: "Sofort", sub: "Wichtig · Dringend", color: "#FF3B3B", imp: true, urg: true },
+    { id: "eh-q2", title: "Einplanen", sub: "Wichtig · nicht dringend", color: "#AAFF00", imp: true, urg: false },
+    { id: "eh-q3", title: "Minimieren", sub: "unwichtig · Dringend", color: "#FFB800", imp: false, urg: true },
+    { id: "eh-q4", title: "Streichen", sub: "unwichtig · nicht dringend", color: "#707070", imp: false, urg: false },
+  ];
   return (
     <div className="view">
       <div className="between" style={{ marginBottom: 12 }}>
         <h2 className="display" style={{ fontSize: 24 }}>Aufgaben</h2>
-        <span className="mono" style={{ fontSize: 11, color: "var(--muted)" }}>{filtered.length} TASKS</span>
+        <div className="row" style={{ gap: 4 }}>
+          <button className={`chip ${viewMode === "kanban" ? "on" : ""}`} onClick={() => setViewMode("kanban")} style={{ fontSize: 11 }}>Board</button>
+          <button className={`chip ${viewMode === "matrix" ? "on" : ""}`} onClick={() => setViewMode("matrix")} style={{ fontSize: 11 }}>Matrix</button>
+        </div>
       </div>
       <div className="row" style={{ gap: 6, marginBottom: 12, overflowX: "auto", paddingBottom: 4 }}>
         <button className={`chip ${filter === "all" ? "on" : ""}`} onClick={() => setFilter("all")}>Alle</button>
@@ -4339,6 +4384,58 @@ function TasksView({ state, dispatch, openTask }) {
         <button className={`chip ${filter === "2" ? "on" : ""}`} onClick={() => setFilter("2")}><span className="prio-dot prio-2" />Mittel</button>
         <button className={`chip ${filter === "1" ? "on" : ""}`} onClick={() => setFilter("1")}><span className="prio-dot prio-1" />Niedrig</button>
       </div>
+      {viewMode === "matrix" && (
+        <>
+          <div style={{ fontSize: 11, color: "var(--muted)", marginBottom: 10 }}>
+            Dringend = überfällig oder ≤ 2 Tage · Wichtig = Prio hoch oder 💩. Karte ziehen ändert Prio/Datum entsprechend.
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+            {EH_QUADS.map(q => {
+              const qTasks = matrixTasks.filter(t => ehIsImportant(t) === q.imp && ehIsUrgent(t) === q.urg);
+              const isOver = drag.active && drag.overId === q.id;
+              return (
+                <div key={q.id} data-drop-zone={q.id}
+                  onDragOver={(e) => e.preventDefault()}
+                  onDrop={(e) => { e.preventDefault(); const id = e.dataTransfer.getData("text/plain"); if (id) onDrop(id, q.id); }}
+                  style={{ background: "var(--s0)", border: `1px solid ${isOver ? q.color : "var(--border)"}`, borderRadius: "var(--r)", padding: 8, minHeight: 150, boxShadow: isOver ? `inset 0 0 0 1px ${q.color}` : "none" }}>
+                  <div style={{ borderLeft: `3px solid ${q.color}`, paddingLeft: 7, marginBottom: 8 }}>
+                    <div className="display" style={{ fontSize: 12, color: q.color }}>{q.title}</div>
+                    <div className="mono" style={{ fontSize: 9, color: "var(--muted)" }}>{q.sub} · {qTasks.length}</div>
+                  </div>
+                  {qTasks.map(t => (
+                    <div key={t.id}
+                      className={`task-card ${drag.id === t.id ? "dragging" : ""}`}
+                      draggable
+                      onDragStart={(e) => { e.dataTransfer.setData("text/plain", t.id); e.dataTransfer.effectAllowed = "move"; }}
+                      onTouchStart={(e) => startDrag(t.id, e, t.title)}
+                      onClick={() => { if (!drag.active) openTask(t.id); }}
+                      style={{ padding: 8, marginBottom: 6 }}>
+                      <div className="row" style={{ gap: 4, marginBottom: 4 }}>
+                        {t.isFrog && <span style={{ fontSize: 11 }}>💩</span>}
+                        <span className="tag" style={{ background: catOf(t.category).color + "1A", color: catOf(t.category).color, fontSize: 9 }}>{catOf(t.category).icon}</span>
+                        <div className={`prio-dot ${prioOf(t.priority).className}`} style={{ marginLeft: "auto" }} />
+                      </div>
+                      <p style={{ fontSize: 12, fontWeight: 500, lineHeight: 1.25 }}>{t.title}</p>
+                      {(t.endDate || t.startDate) && (
+                        <div className="mono" style={{ fontSize: 9, color: "var(--muted)", marginTop: 4 }}>
+                          📅 {new Date((t.endDate || t.startDate) + "T12:00:00").toLocaleDateString("de-DE", { day: "numeric", month: "short" })}
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                  {qTasks.length === 0 && <div style={{ textAlign: "center", padding: "14px 0", color: "var(--dim)", fontSize: 10 }}>—</div>}
+                </div>
+              );
+            })}
+          </div>
+          {drag.active && drag.ghost && (
+            <div className="drag-ghost" style={{ left: drag.x - drag.offsetX, top: drag.y - drag.offsetY, width: 200 }}>
+              <div className="task-card"><p style={{ fontSize: 12 }}>{drag.ghost}</p></div>
+            </div>
+          )}
+        </>
+      )}
+      {viewMode === "kanban" && (
       <div className="kanban">
         {STATUSES.map(col => {
           let colTasks = filtered.filter(t => t.status === col.id);
@@ -4435,7 +4532,8 @@ function TasksView({ state, dispatch, openTask }) {
           );
         })}
       </div>
-      {drag.active && drag.ghost && (
+      )}
+      {viewMode === "kanban" && drag.active && drag.ghost && (
         <div className="drag-ghost" style={{ left: drag.x - drag.offsetX, top: drag.y - drag.offsetY, width: 220 }}>
           <div className="task-card"><p style={{ fontSize: 13 }}>{drag.ghost}</p></div>
         </div>
