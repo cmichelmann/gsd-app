@@ -240,7 +240,7 @@ html, body, #root { height: 100%; background: #000; color: var(--text); overflow
 const SCHEMA_VERSION = 14;
 // One-line "what changed" shown once after an update (post-reload changelog toast).
 // Bump together with package.json version on every release.
-const RELEASE_NOTE = "iCal-Export (.ics) \u00b7 Wochenrueckblick-Nudge (Sonntag) mit 3-Schritt-Modal";
+const RELEASE_NOTE = "Eigenes Status-Bar-Icon (Kackhaufen-Charakter) statt generischem Android-Default";
 const STORAGE_KEY = "gsd-data";
 
 // localStorage wrapper that mimics Claude's window.storage API
@@ -1336,7 +1336,7 @@ const Notif = {
           id: this.toIntId(id), title, body,
           schedule: { at: shiftedAt, allowWhileIdle: true },
           extra: { channelKey, ...(extra || {}) },
-          smallIcon: "ic_stat_icon_config_sample",
+          smallIcon: "ic_stat_poo",
         };
         if (largeBody) notification.largeBody = largeBody;
         if (actionTypeId) notification.actionTypeId = actionTypeId;
@@ -1364,7 +1364,7 @@ const Notif = {
             id: this.toIntId(n.id), title: n.title, body: n.body,
             schedule: { at: new Date(n.at), allowWhileIdle: true },
             extra: { channelKey: n.channelKey, ...(n.extra || {}) },
-            smallIcon: "ic_stat_icon_config_sample",
+            smallIcon: "ic_stat_poo",
           };
           if (n.largeBody) o.largeBody = n.largeBody;
           if (n.actionTypeId) o.actionTypeId = n.actionTypeId;
