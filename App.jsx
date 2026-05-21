@@ -237,10 +237,10 @@ html, body, #root { height: 100%; background: #000; color: var(--text); overflow
 // ════════════════════════════════════════════════════════════════════════════
 // SCHEMA & MIGRATIONS
 // ════════════════════════════════════════════════════════════════════════════
-const SCHEMA_VERSION = 13;
+const SCHEMA_VERSION = 14;
 // One-line "what changed" shown once after an update (post-reload changelog toast).
 // Bump together with package.json version on every release.
-const RELEASE_NOTE = "Eisenhower-Matrix in den Aufgaben (Board \u2194 Matrix) \u2014 Karten zwischen Quadranten ziehen passt Prio/Datum an";
+const RELEASE_NOTE = "iCal-Export (.ics) \u00b7 Wochenrueckblick-Nudge (Sonntag) mit 3-Schritt-Modal";
 const STORAGE_KEY = "gsd-data";
 
 // localStorage wrapper that mimics Claude's window.storage API
@@ -289,6 +289,8 @@ function getDefaults() {
       morningNudgeEnabled: true, morningNudgeTime: "09:00",
       // Super-Penetrations-Modus for every birthday (per-item flag overridden by this when on)
       superModeAllBirthdays: false,
+      // Weekly Review nudge
+      weeklyReviewEnabled: true, weeklyReviewDay: 6, lastWeeklyReviewDate: null,
       calendarFilters: { tasks: true, events: true, vacation: true, birthdays: true, holidays: true, habits: true, sport: true, muell: false },
       searchHistory: [],
       featureGratitude: true, featureAchievements: true, featureHeatmap: true,
@@ -400,6 +402,15 @@ const migrations = {
       ...g,
       items: (g.items || []).map(it => (typeof it === "string" ? { text: it } : it)),
     })),
+  }),
+  14: (d) => ({
+    ...d, version: 14,
+    settings: {
+      weeklyReviewEnabled: true,
+      weeklyReviewDay: 6, // 0=Mo … 6=So (project convention)
+      lastWeeklyReviewDate: null,
+      ...(d.settings || {}),
+    },
   }),
 };
 
@@ -678,6 +689,104 @@ function icsEventToGsd(ev, { type, reminderMinutes, source }) {
     ...(isMuell ? { muellBin: bin.label, muellIcon: bin.icon } : {}),
   };
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// iCal builder — generate a .ics from GSD events (+ optional tasks). Holidays
+// are always excluded. Birthdays get RRULE:FREQ=YEARLY so other calendars
+// repeat them. All-day DTEND is exclusive (+1 day) per RFC 5545.
+// ────────────────────────────────────────────────────────────────────────────
+function icsEscape(s) {
+  return String(s || "")
+    .replace(/\\/g, "\\\\").replace(/;/g, "\\;").replace(/,/g, "\\,")
+    .replace(/\n/g, "\\n").replace(/\r/g, "");
+}
+function icsDateAllDay(yyyymmdd) { return yyyymmdd.replace(/-/g, ""); }
+function icsAddDayAllDay(yyyymmdd) {
+  const d = new Date(yyyymmdd + "T12:00:00"); d.setDate(d.getDate() + 1);
+  return localDate(d).replace(/-/g, "");
+}
+function icsDateTimeFloating(date, hhmm) {
+  // Floating local time: YYYYMMDDTHHMMSS (no Z, no TZID). Most readers display as local.
+  const [h, m] = (hhmm || "00:00").split(":");
+  return `${date.replace(/-/g, "")}T${String(h).padStart(2, "0")}${String(m).padStart(2, "0")}00`;
+}
+function icsFoldLine(line) {
+  // RFC 5545: lines must be ≤ 75 octets, continuations start with a space.
+  if (line.length <= 73) return line;
+  const out = []; let i = 0;
+  while (i < line.length) { out.push((i === 0 ? "" : " ") + line.slice(i, i + 73)); i += 73; }
+  return out.join("\r\n");
+}
+function buildICS(state, { includeEvents = true, includeTasks = false, includeMuell = false, includeBirthdays = true, includeVacation = true, calName = "GET SHIT DONE" } = {}) {
+  const lines = [
+    "BEGIN:VCALENDAR",
+    "VERSION:2.0",
+    "PRODID:-//GSD//gsd-app//DE",
+    "CALSCALE:GREGORIAN",
+    "METHOD:PUBLISH",
+    `X-WR-CALNAME:${icsEscape(calName)}`,
+  ];
+  const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+/, "");
+  const pushEvent = ({ uid, summary, description, location, startDate, endDate, allDay, startTime, endTime, yearly }) => {
+    const block = ["BEGIN:VEVENT", `UID:${uid}`, `DTSTAMP:${stamp}`];
+    if (allDay) {
+      const end = endDate || startDate;
+      block.push(`DTSTART;VALUE=DATE:${icsDateAllDay(startDate)}`);
+      block.push(`DTEND;VALUE=DATE:${icsAddDayAllDay(end)}`);
+    } else {
+      block.push(`DTSTART:${icsDateTimeFloating(startDate, startTime || "09:00")}`);
+      if (endDate || endTime) block.push(`DTEND:${icsDateTimeFloating(endDate || startDate, endTime || startTime || "10:00")}`);
+    }
+    if (summary) block.push(`SUMMARY:${icsEscape(summary)}`);
+    if (description) block.push(`DESCRIPTION:${icsEscape(description)}`);
+    if (location) block.push(`LOCATION:${icsEscape(location)}`);
+    if (yearly) block.push("RRULE:FREQ=YEARLY");
+    block.push("END:VEVENT");
+    lines.push(...block.map(icsFoldLine));
+  };
+
+  (state.events || []).forEach(e => {
+    if (e.isHoliday) return;
+    if (e.type === "birthday" && !includeBirthdays) return;
+    if (e.type === "vacation" && !includeVacation) return;
+    if (e.type === "muell" && !includeMuell) return;
+    if (e.type === "event" && !includeEvents) return;
+    pushEvent({
+      uid: e.icalUid || `${e.id}@gsd`,
+      summary: e.title,
+      description: e.notes || "",
+      location: "",
+      startDate: e.startDate,
+      endDate: e.endDate || e.startDate,
+      allDay: !!e.allDay,
+      startTime: e.startTime || "",
+      endTime: e.endTime || "",
+      yearly: e.type === "birthday" || (e.recurrence && e.recurrence.type === "yearly"),
+    });
+  });
+
+  if (includeTasks) {
+    (state.tasks || []).forEach(t => {
+      if (!t.startDate) return;
+      pushEvent({
+        uid: `task-${t.id}@gsd`,
+        summary: (t.isFrog ? "💩 " : "") + (t.title || ""),
+        description: [t.notes, (t.subtasks || []).filter(s => !s.done).map(s => "☐ " + s.title).join("\n")].filter(Boolean).join("\n\n"),
+        location: "",
+        startDate: t.startDate,
+        endDate: t.endDate || t.startDate,
+        allDay: !!t.allDay,
+        startTime: t.startTime || "",
+        endTime: t.endTime || "",
+        yearly: false,
+      });
+    });
+  }
+
+  lines.push("END:VCALENDAR");
+  return lines.join("\r\n");
+}
+
 const WORKOUT_TYPES = [
   { id: "strength", label: "Kraft",      emoji: "💪", color: "#AAFF00" },
   { id: "cardio",   label: "Ausdauer",   emoji: "🏃", color: "#00E0FF" },
@@ -3592,6 +3701,36 @@ function SettingsModal({ state, dispatch, onClose }) {
       } catch { setAutoBackups([]); }
     })();
   }, []);
+  const [icalExportOpts, setIcalExportOpts] = useState(null); // null | { includeEvents, includeBirthdays, includeVacation, includeMuell, includeTasks }
+  const openIcalExport = () => setIcalExportOpts({ includeEvents: true, includeBirthdays: true, includeVacation: true, includeMuell: false, includeTasks: false });
+  const runIcalExport = async () => {
+    const opts = icalExportOpts; if (!opts) return;
+    const ics = buildICS(state, opts);
+    const filename = `gsd-calendar-${localDate()}.ics`;
+    const isCap = typeof window !== "undefined" && !!window.Capacitor?.isNativePlatform?.();
+    setIcalExportOpts(null);
+    if (isCap) {
+      try {
+        const written = await Filesystem.writeFile({
+          path: filename, data: ics, directory: Directory.Cache, encoding: Encoding.UTF8,
+        });
+        await Share.share({ title: "GSD Kalender", url: written.uri, dialogTitle: "iCal teilen oder speichern" });
+        return;
+      } catch (e) {
+        if (e?.message?.toLowerCase?.().includes("cancel")) return;
+        alert("iCal-Export fehlgeschlagen: " + (e?.message || "unbekannt"));
+        return;
+      }
+    }
+    try {
+      const blob = new Blob([ics], { type: "text/calendar" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a"); a.href = url; a.download = filename;
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (e) { alert("Download fehlgeschlagen: " + (e?.message || "unbekannt")); }
+  };
+
   const restoreAutoBackup = async (name) => {
     try {
       const res = await Filesystem.readFile({ path: name, directory: Directory.Documents, encoding: Encoding.UTF8 });
@@ -3917,12 +4056,13 @@ function SettingsModal({ state, dispatch, onClose }) {
             </div>
           )}
 
-          {/* iCal / Kalender-Import */}
-          <div className="section-title">📅 Kalender-Import (.ics)</div>
+          {/* iCal / Kalender-Import + Export */}
+          <div className="section-title">📅 Kalender (.ics)</div>
           <label className="btn btn-ghost" style={{ cursor: "pointer" }}>
             <Calendar size={14} /> iCal-Datei importieren
             <input type="file" accept=".ics,text/calendar" onChange={e => { if (e.target.files[0]) { importICal(e.target.files[0]); e.target.value = ""; } }} style={{ display: "none" }} />
           </label>
+          <button className="btn btn-ghost" onClick={openIcalExport}><Download size={14} /> iCal-Datei exportieren</button>
           {icalSources.length > 0 && (
             <div className="card-sm">
               <div className="stat-label" style={{ marginBottom: 6 }}>Importierte Kalender</div>
@@ -3969,6 +4109,38 @@ function SettingsModal({ state, dispatch, onClose }) {
                 <div className="row" style={{ gap: 8 }}>
                   <button className="btn btn-ghost" onClick={() => setIcalPreview(null)} style={{ flex: 1 }}>Abbrechen</button>
                   <button className="btn btn-primary" onClick={commitICalImport} style={{ flex: 2 }}>Importieren</button>
+                </div>
+              </div>
+            </div>
+          )}
+          {icalExportOpts && (
+            <div className="overlay center" onClick={e => e.target === e.currentTarget && setIcalExportOpts(null)}>
+              <div className="modal center">
+                <div className="between" style={{ marginBottom: 12 }}>
+                  <h3 className="display" style={{ fontSize: 18 }}>📅 iCal exportieren</h3>
+                  <button className="btn btn-ghost btn-icon" onClick={() => setIcalExportOpts(null)}><X size={18} /></button>
+                </div>
+                <div className="label" style={{ marginBottom: 6 }}>Was soll mit rein?</div>
+                {[
+                  { k: "includeEvents", label: "📅 Termine", hint: "Alle normalen Termine" },
+                  { k: "includeBirthdays", label: "🎂 Geburtstage", hint: "Mit jährlicher Wiederholung (RRULE)" },
+                  { k: "includeVacation", label: "✈️ Urlaube", hint: "" },
+                  { k: "includeMuell", label: "🗑️ Müll", hint: "Importierte Abfuhrtermine mit raus" },
+                  { k: "includeTasks", label: "⚡ Aufgaben mit Datum", hint: "Als Termine im Zielkalender" },
+                ].map(row => (
+                  <label key={row.k} className="card-sm" style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 6, cursor: "pointer" }}
+                    onClick={() => setIcalExportOpts(o => ({ ...o, [row.k]: !o[row.k] }))}>
+                    <span className={`chk ${icalExportOpts[row.k] ? "on" : ""}`}>{icalExportOpts[row.k] && <Check size={12} color="#000" strokeWidth={3} />}</span>
+                    <div style={{ flex: 1 }}>
+                      <div style={{ fontSize: 13, fontWeight: 600 }}>{row.label}</div>
+                      {row.hint && <div style={{ fontSize: 10, color: "var(--muted)", marginTop: 2 }}>{row.hint}</div>}
+                    </div>
+                  </label>
+                ))}
+                <div style={{ fontSize: 10, color: "var(--muted)", margin: "8px 0 12px" }}>Feiertage sind nie dabei (kommen ohnehin aus jedem Kalender automatisch).</div>
+                <div className="row" style={{ gap: 8 }}>
+                  <button className="btn btn-ghost" onClick={() => setIcalExportOpts(null)} style={{ flex: 1 }}>Abbrechen</button>
+                  <button className="btn btn-primary" onClick={runIcalExport} style={{ flex: 2 }}><Download size={13} /> Exportieren</button>
                 </div>
               </div>
             </div>
@@ -4095,7 +4267,14 @@ function buildDayItems(state, dateStr) {
   });
 }
 
-function DashboardView({ state, dispatch, openTask, openEvent, openPomo, setShowRitual }) {
+function isWeeklyReviewDue(settings) {
+  if (!settings?.weeklyReviewEnabled) return false;
+  const today = localDate();
+  if (settings.lastWeeklyReviewDate === today) return false;
+  const wd = (new Date().getDay() + 6) % 7; // 0=Mo … 6=So
+  return wd === (settings.weeklyReviewDay ?? 6);
+}
+function DashboardView({ state, dispatch, openTask, openEvent, openPomo, setShowRitual, setShowReview }) {
   const today = localDate();
   const tomorrow = localDate(addDays(new Date(), 1));
   const frog = state.tasks.find(t => t.isFrog && t.status !== "done");
@@ -4212,6 +4391,19 @@ function DashboardView({ state, dispatch, openTask, openEvent, openPomo, setShow
           GUTEN {greet}<span style={{ color: "var(--lime)" }}>{name}</span>
         </h1>
       </div>
+
+      {/* Weekly review nudge — shows on the configured day of the week */}
+      {isWeeklyReviewDue(state.settings) && (
+        <div className="card" style={{ marginBottom: 12, cursor: "pointer", borderLeft: "3px solid #00E0FF", background: "rgba(0,224,255,0.06)" }} onClick={() => setShowReview && setShowReview(true)}>
+          <div className="between">
+            <div>
+              <div className="stat-label" style={{ color: "#00E0FF" }}>📋 Wochenrückblick</div>
+              <div style={{ fontSize: 13, fontWeight: 600, marginTop: 2 }}>Rückblick &amp; Plan für die nächste Woche</div>
+            </div>
+            <ChevronRight size={20} color="#00E0FF" />
+          </div>
+        </div>
+      )}
 
       {/* 1. Daily Plan */}
       {!ritualDoneToday && (
@@ -7165,6 +7357,148 @@ class ErrorBoundary extends React.Component {
   }
 }
 
+function WeeklyReviewModal({ state, dispatch, onClose }) {
+  const today = localDate();
+  const sevenAgo = localDate(addDays(new Date(), -7));
+  const [step, setStep] = useState(1);
+  const tasksDone = state.tasks.filter(t => t.completedAt && localDate(new Date(t.completedAt)) >= sevenAgo);
+  const slipped = state.tasks.filter(t => t.status !== "done" && !t.archived && (t.endDate || t.startDate) && (t.endDate || t.startDate) < today);
+  const habitsList = (state.habits || []);
+  const habitsRate = (() => {
+    if (!habitsList.length) return null;
+    let total = 0, done = 0;
+    for (let i = 1; i <= 7; i++) {
+      const d = localDate(addDays(new Date(), -i));
+      habitsList.forEach(h => {
+        if (h.weekdays && h.weekdays.length && !h.weekdays.includes((new Date(d + "T12:00:00").getDay() + 6) % 7)) return;
+        total++; if ((h.completions || {})[d]) done++;
+      });
+    }
+    return total ? Math.round((done / total) * 100) : null;
+  })();
+  const pomos = (state.pomodoros || []).filter(p => localDate(new Date(p.completedAt)) >= sevenAgo).length;
+  const workoutsDone = (state.workouts || []).reduce((a, w) => a + Object.keys(w.completions || {}).filter(d => d >= sevenAgo).length, 0);
+  // Gratitude recap (last 7 days)
+  const grWeek = (state.gratitude || []).filter(g => g.date >= sevenAgo);
+  let grTopCat = null;
+  if (grWeek.length) {
+    const m = {};
+    grWeek.forEach(g => (g.items || []).forEach(it => { const c = gItemCat(it); if (c) m[c] = (m[c] || 0) + 1; }));
+    const top = Object.entries(m).sort((a, b) => b[1] - a[1])[0];
+    if (top) grTopCat = GRATITUDE_CATS.find(c => c.id === top[0]);
+  }
+  // Upcoming events / birthdays in next 7d
+  const next7 = localDate(addDays(new Date(), 7));
+  const upcoming = (state.events || []).filter(e => !e.isHoliday && e.startDate >= today && e.startDate <= next7).sort((a, b) => a.startDate.localeCompare(b.startDate));
+
+  const reschedule = (taskId, days) => {
+    const d = localDate(addDays(new Date(), days));
+    dispatch({ type: "UPD_TASK", payload: { id: taskId, startDate: d, endDate: d } });
+  };
+  const markDone = (taskId) => dispatch({ type: "MOVE_TASK", payload: { id: taskId, status: "done" } });
+  const finish = () => {
+    dispatch({ type: "UPD_SETTINGS", payload: { lastWeeklyReviewDate: today } });
+    fireCelebration();
+    onClose();
+  };
+
+  return createPortal(
+    <div className="overlay" onClick={e => e.target === e.currentTarget && onClose()}>
+      <div className="modal">
+        <div className="grip" />
+        <div className="between" style={{ marginBottom: 12 }}>
+          <h3 className="display" style={{ fontSize: 18 }}>📋 Wochenrückblick · Schritt {step}/3</h3>
+          <button className="btn btn-ghost btn-icon" onClick={onClose}><X size={18} /></button>
+        </div>
+
+        {step === 1 && (
+          <>
+            <div className="stat-grid" style={{ marginBottom: 12 }}>
+              <div className="stat-tile"><div className="stat-label">Tasks erledigt</div><div className="stat-val" style={{ color: "var(--lime)" }}>{tasksDone.length}</div></div>
+              <div className="stat-tile"><div className="stat-label">Pomodoros</div><div className="stat-val">{pomos}</div></div>
+              <div className="stat-tile"><div className="stat-label">Workouts</div><div className="stat-val">{workoutsDone}</div></div>
+              <div className="stat-tile"><div className="stat-label">Habits-Quote</div><div className="stat-val">{habitsRate == null ? "–" : `${habitsRate}%`}</div></div>
+            </div>
+            {tasksDone.length > 0 && (
+              <div className="card-sm" style={{ marginBottom: 10 }}>
+                <div className="stat-label" style={{ marginBottom: 6 }}>Erledigt in den letzten 7 Tagen</div>
+                {tasksDone.slice(0, 8).map(t => (
+                  <div key={t.id} style={{ fontSize: 12, padding: "3px 0" }}>{t.isFrog ? "💩" : "✓"} {t.title}</div>
+                ))}
+                {tasksDone.length > 8 && <div style={{ fontSize: 10, color: "var(--muted)", marginTop: 4 }}>+ {tasksDone.length - 8} weitere</div>}
+              </div>
+            )}
+            {grWeek.length > 0 && (
+              <div className="card-sm" style={{ marginBottom: 10, borderLeft: "3px solid #FFB800" }}>
+                <div className="stat-label" style={{ marginBottom: 4 }}>🙏 Dankbarkeit diese Woche</div>
+                <div style={{ fontSize: 12 }}>{grWeek.length} Tage · {grWeek.reduce((a, g) => a + (g.items || []).length, 0)} Einträge{grTopCat && <> · meist {grTopCat.emoji} {grTopCat.label}</>}</div>
+              </div>
+            )}
+            <div className="row" style={{ gap: 8, marginTop: 4 }}>
+              <button className="btn btn-ghost" onClick={onClose} style={{ flex: 1 }}>Später</button>
+              <button className="btn btn-primary" onClick={() => setStep(2)} style={{ flex: 2 }}>Weiter →</button>
+            </div>
+          </>
+        )}
+
+        {step === 2 && (
+          <>
+            <div style={{ fontSize: 12, color: "var(--muted)", marginBottom: 8 }}>
+              {slipped.length === 0 ? "Nichts liegengeblieben — saubere Woche! 🎉" : `${slipped.length} liegengeblieben — was tun?`}
+            </div>
+            <div className="col" style={{ gap: 6, maxHeight: 320, overflowY: "auto" }}>
+              {slipped.map(t => (
+                <div key={t.id} className="card-sm">
+                  <div className="between" style={{ marginBottom: 6 }}>
+                    <span className="tag" style={{ background: catOf(t.category).color + "1A", color: catOf(t.category).color, fontSize: 10 }}>{catOf(t.category).icon} {catOf(t.category).label}</span>
+                    <span className="mono" style={{ fontSize: 10, color: "#FF3B3B" }}>seit {new Date((t.endDate || t.startDate) + "T12:00:00").toLocaleDateString("de-DE", { day: "numeric", month: "short" })}</span>
+                  </div>
+                  <div style={{ fontSize: 13, fontWeight: 500, marginBottom: 6 }}>{t.title}</div>
+                  <div className="row" style={{ gap: 4, flexWrap: "wrap" }}>
+                    <button className="btn btn-ghost" onClick={() => reschedule(t.id, 0)} style={{ padding: "4px 8px", fontSize: 10 }}>→ Heute</button>
+                    <button className="btn btn-ghost" onClick={() => reschedule(t.id, 7)} style={{ padding: "4px 8px", fontSize: 10 }}>→ +7 Tage</button>
+                    <button className="btn btn-ghost" onClick={() => markDone(t.id)} style={{ padding: "4px 8px", fontSize: 10, color: "var(--lime)" }}>✓ Erledigt</button>
+                    <button className="btn btn-ghost" onClick={() => { if (confirm("Task löschen?")) dispatch({ type: "DEL_TASK", payload: t.id }); }} style={{ padding: "4px 8px", fontSize: 10, color: "#FF3B3B" }}>🗑️</button>
+                  </div>
+                </div>
+              ))}
+            </div>
+            <div className="row" style={{ gap: 8, marginTop: 10 }}>
+              <button className="btn btn-ghost" onClick={() => setStep(1)} style={{ flex: 1 }}>← Zurück</button>
+              <button className="btn btn-primary" onClick={() => setStep(3)} style={{ flex: 2 }}>Weiter →</button>
+            </div>
+          </>
+        )}
+
+        {step === 3 && (
+          <>
+            <div style={{ fontSize: 12, color: "var(--muted)", marginBottom: 8 }}>Kommende 7 Tage im Blick</div>
+            <div className="col" style={{ gap: 6, maxHeight: 240, overflowY: "auto", marginBottom: 12 }}>
+              {upcoming.length === 0 && <div className="empty"><p style={{ fontSize: 12 }}>Keine Termine</p></div>}
+              {upcoming.map(e => (
+                <div key={e.id} className="card-sm" style={{ borderLeft: `3px solid ${e.color || "#00E0FF"}` }}>
+                  <div className="between">
+                    <div style={{ fontSize: 13 }}>{e.type === "birthday" ? "🎂" : e.type === "vacation" ? "✈️" : e.type === "muell" ? "🗑️" : "📅"} {e.title}</div>
+                    <span className="mono" style={{ fontSize: 11, color: "var(--muted)" }}>{new Date(e.startDate + "T12:00:00").toLocaleDateString("de-DE", { weekday: "short", day: "numeric", month: "short" })}</span>
+                  </div>
+                </div>
+              ))}
+            </div>
+            <div style={{ fontSize: 11, color: "var(--muted)", marginBottom: 10, lineHeight: 1.4 }}>
+              Tipp: Frog für die kommende Woche festlegen → in Tasks die wichtigste Aufgabe als 💩 markieren.
+            </div>
+            <div className="row" style={{ gap: 8 }}>
+              <button className="btn btn-ghost" onClick={() => setStep(2)} style={{ flex: 1 }}>← Zurück</button>
+              <button className="btn btn-primary" onClick={finish} style={{ flex: 2 }}>✓ Woche abschließen</button>
+            </div>
+          </>
+        )}
+      </div>
+    </div>,
+    document.body
+  );
+}
+
 export default function App() {
   return <ErrorBoundary><AppInner /></ErrorBoundary>;
 }
@@ -7187,6 +7521,7 @@ function AppInner() {
   const [showSearch, setShowSearch] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [showRitual, setShowRitual] = useState(false);
+  const [showReview, setShowReview] = useState(false);
   const [moreSubView, setMoreSubView] = useState(null);
   const [loaded, setLoaded] = useState(false);
   const [showSplash, setShowSplash] = useState(true); // Splash IMMER beim Start
@@ -7385,6 +7720,7 @@ function AppInner() {
   useEffect(() => {
     const handleBack = () => {
       if (showRitual) { setShowRitual(false); return true; }
+      if (showReview) { setShowReview(false); return true; }
       if (showSearch) { setShowSearch(false); return true; }
       if (showSettings) { setShowSettings(false); return true; }
       if (showQuickAdd) { setShowQuickAdd(false); return true; }
@@ -7416,7 +7752,7 @@ function AppInner() {
       window.history.pushState({ gsdGuard: true }, "");
     }
     return () => window.removeEventListener("popstate", onPop);
-  }, [showRitual, showSearch, showSettings, showQuickAdd, showAddTask, showAddEvent, showAddWorkout, editingWorkout, pomoTaskId, openTaskId, openEventId, moreSubView, state.view]);
+  }, [showRitual, showReview, showSearch, showSettings, showQuickAdd, showAddTask, showAddEvent, showAddWorkout, editingWorkout, pomoTaskId, openTaskId, openEventId, moreSubView, state.view]);
 
   // LOAD
   useEffect(() => {
@@ -7635,7 +7971,7 @@ function AppInner() {
         </div>
 
         <div className="main">
-          {state.view === "dashboard" && <DashboardView state={state} dispatch={dispatch} openTask={openTask} openEvent={openEvent} openPomo={openPomo} setShowRitual={setShowRitual} />}
+          {state.view === "dashboard" && <DashboardView state={state} dispatch={dispatch} openTask={openTask} openEvent={openEvent} openPomo={openPomo} setShowRitual={setShowRitual} setShowReview={setShowReview} />}
           {state.view === "tasks" && <TasksView state={state} dispatch={dispatch} openTask={openTask} />}
           {state.view === "calendar" && <CalendarView state={state} dispatch={dispatch} openTask={openTask} openEvent={openEvent} setShowAddEvent={setShowAddEvent} openAddEvent={(d) => { setAddEventDate(d); setShowAddEvent(true); }} />}
           {state.view === "sport" && <SportView state={state} dispatch={dispatch} setShowAddWorkout={setShowAddWorkout} setEditingWorkout={setEditingWorkout} />}
@@ -7724,6 +8060,7 @@ function AppInner() {
         {showSearch && <SearchModal state={state} dispatch={dispatch} onClose={() => setShowSearch(false)} openTask={openTask} openEvent={openEvent} />}
         {showSettings && <SettingsModal state={state} dispatch={dispatch} onClose={() => setShowSettings(false)} />}
         {showRitual && <DailyRitualModal tasks={state.tasks} dispatch={dispatch} onClose={() => setShowRitual(false)} />}
+        {showReview && <WeeklyReviewModal state={state} dispatch={dispatch} onClose={() => setShowReview(false)} />}
       </div>
     </>
   );
